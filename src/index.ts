@@ -99,6 +99,8 @@ async function startServer(): Promise<void> {
   const host = config.host || "127.0.0.1";
   const port = config.port;
 
+  const adminEnabled = config["admin-keys"].length > 0;
+
   app.listen(port, host, () => {
     console.log(`auth2api running on http://${host}:${port}`);
     if (manager.accountCount > 1) {
@@ -112,8 +114,12 @@ async function startServer(): Promise<void> {
     console.log(`  POST /v1/messages`);
     console.log(`  POST /v1/messages/count_tokens`);
     console.log(`  GET  /v1/models`);
-    console.log(`  GET  /admin/accounts`);
-    console.log(`  POST /admin/accounts/:email/enable`);
+    if (adminEnabled) {
+      console.log(`  GET  /admin/accounts              [admin-keys]`);
+      console.log(`  POST /admin/accounts/:email/enable [admin-keys]`);
+    } else {
+      console.log(`  (admin routes disabled — set admin-keys in config.yaml to enable)`);
+    }
     console.log(`  GET  /health`);
   });
 

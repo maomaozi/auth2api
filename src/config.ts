@@ -27,6 +27,7 @@ export interface Config {
   port: number;
   "auth-dir": string;
   "api-keys": string[];
+  "admin-keys": string[];
   "body-limit": string;
   cloaking: CloakingConfig;
   timeouts: TimeoutConfig;
@@ -38,6 +39,7 @@ const DEFAULT_CONFIG: Config = {
   port: 8317,
   "auth-dir": "~/.auth2api",
   "api-keys": [],
+  "admin-keys": [],
   "body-limit": "200mb",
   cloaking: {
     "cli-version": "2.1.88",
@@ -101,8 +103,13 @@ export function loadConfig(configPath?: string): Config {
     (config as Config & { debug?: unknown }).debug,
   );
 
+  // Normalize key lists to arrays so a malformed YAML scalar (e.g.
+  // `api-keys: "sk-foo"`) cannot crash middleware later.
+  if (!Array.isArray(config["api-keys"])) config["api-keys"] = [];
+  if (!Array.isArray(config["admin-keys"])) config["admin-keys"] = [];
+
   // Auto-generate API key if none configured
-  if (!config["api-keys"] || config["api-keys"].length === 0) {
+  if (config["api-keys"].length === 0) {
     const key = generateApiKey();
     config["api-keys"] = [key];
     // Write config with generated key

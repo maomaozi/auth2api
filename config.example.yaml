@@ -5,8 +5,15 @@ port: 8317
 auth-dir: "~/.auth2api"
 
 # API keys for client authentication (clients use these to access this proxy)
+# These keys grant access to /v1/* (model inference) only, NOT /admin/*.
 api-keys:
   - "your-api-key-here"
+
+# Admin keys for managing the account pool (/admin/*).
+# These are completely separate from api-keys so that usage keys cannot
+# manage accounts. If left empty, the /admin/* routes are disabled.
+admin-keys: []
+  # - "your-admin-key-here"
 
 # Maximum JSON request body size
 body-limit: "200mb"

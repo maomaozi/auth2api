@@ -111,24 +111,37 @@ export function createServer(
     next();
   });
 
-  // API key auth middleware — accepts both OpenAI style (Authorization: Bearer)
-  // and Anthropic style (x-api-key), so Claude Code and OpenAI clients both work
-  const requireApiKey: express.RequestHandler = (req, res, next) => {
-    const key = extractApiKey(req.headers);
-    if (!key) {
-      res.status(401).json({ error: { message: "Missing API key" } });
-      return;
-    }
-    const valid = config["api-keys"].some((k) => safeCompare(key, k));
-    if (!valid) {
-      res.status(403).json({ error: { message: "Invalid API key" } });
-      return;
-    }
-    next();
+  // Key auth middleware factory — accepts both OpenAI style (Authorization:
+  // Bearer) and Anthropic style (x-api-key) so Claude Code and OpenAI clients
+  // both work.
+  const makeKeyAuth = (
+    keys: string[],
+    label: string,
+  ): express.RequestHandler => {
+    return (req, res, next) => {
+      const key = extractApiKey(req.headers);
+      if (!key) {
+        res.status(401).json({ error: { message: `Missing ${label}` } });
+        return;
+      }
+      const valid = keys.some((k) => safeCompare(key, k));
+      if (!valid) {
+        res.status(403).json({ error: { message: `Invalid ${label}` } });
+        return;
+      }
+      next();
+    };
   };
 
-  app.use("/v1", requireApiKey);
-  app.use("/admin", requireApiKey);
+  app.use("/v1", makeKeyAuth(config["api-keys"], "API key"));
+
+  // Admin routes are registered only when admin-keys is configured. This
+  // keeps /admin/* completely invisible (natural Express 404) when disabled,
+  // so usage keys cannot reach the account pool management surface.
+  const adminEnabled = config["admin-keys"].length > 0;
+  if (adminEnabled) {
+    app.use("/admin", makeKeyAuth(config["admin-keys"], "admin key"));
+  }
 
   // Routes — OpenAI compatible
   app.post(
@@ -161,24 +174,26 @@ export function createServer(
     res.json({ status: "ok" });
   });
 
-  app.get("/admin/accounts", (_req, res) => {
-    res.json({
-      accounts: manager.getSnapshots(),
-      account_count: manager.accountCount,
-      generated_at: new Date().toISOString(),
+  if (adminEnabled) {
+    app.get("/admin/accounts", (_req, res) => {
+      res.json({
+        accounts: manager.getSnapshots(),
+        account_count: manager.accountCount,
+        generated_at: new Date().toISOString(),
+      });
     });
-  });
 
-  app.post("/admin/accounts/:email/enable", (req, res) => {
-    const email = req.params.email;
-    if (manager.enableAccount(email)) {
-      res.json({ message: `Account ${email} re-enabled` });
-    } else {
-      res
-        .status(404)
-        .json({ error: { message: `Account ${email} not found` } });
-    }
-  });
+    app.post("/admin/accounts/:email/enable", (req, res) => {
+      const email = req.params.email;
+      if (manager.enableAccount(email)) {
+        res.json({ message: `Account ${email} re-enabled` });
+      } else {
+        res
+          .status(404)
+          .json({ error: { message: `Account ${email} not found` } });
+      }
+    });
+  }
 
   return app;
 }
