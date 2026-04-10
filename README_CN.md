@@ -2,11 +2,11 @@
 
 [English](./README.md)
 
-一个轻量级、单账号的 Claude OAuth 转 API 代理，适合 Claude Code 和 OpenAI 兼容客户端。
+一个轻量级的 Claude OAuth 转 API 代理，适合 Claude Code 和 OpenAI 兼容客户端。
 
 auth2api 的定位很克制，也很明确：
 
-- 一个 Claude OAuth 账号
+- 一个或多个 Claude OAuth 账号，自动轮询
 - 一个本地或自托管代理
 - 一个目标：把 Claude OAuth 登录态变成可调用的 API
 
@@ -14,14 +14,16 @@ auth2api 的定位很克制，也很明确：
 
 ## 功能特性
 
-- **轻量优先**：代码量小、单账号架构、依赖和运行逻辑都尽量简单
-- **Claude OAuth 转 API**：把一个 Claude OAuth 登录账号作为 API 代理账号使用
+- **轻量优先**：代码量小，依赖和运行逻辑都尽量简单
+- **Claude OAuth 转 API**：把一个或多个 Claude OAuth 登录账号作为 API 代理账号使用
+- **账号池自动轮询**：支持多账号粘性轮询（sticky round-robin），上游错误时按类型进入指数退避 cooldown
+- **连续失败自动屏蔽**：账号在连续失败达到阈值后会被自动禁用并输出 warning，可通过 admin 接口一键恢复
 - **OpenAI 兼容 API**：支持 `/v1/chat/completions`、`/v1/responses`、`/v1/models`
 - **Claude 原生透传**：支持 `/v1/messages` 与 `/v1/messages/count_tokens`
 - **适配 Claude Code**：兼容 `Authorization: Bearer` 和 `x-api-key`
 - **覆盖核心能力**：支持流式、工具调用、图片与 reasoning，而不引入大型框架
-- **单账号健康管理**：内置 cooldown、重试、token 刷新和 `/admin/accounts` 状态查看
-- **默认安全设置**：timing-safe API key 校验、每 IP 限流、仅允许 localhost 浏览器 CORS
+- **使用 key 与管理 key 隔离**：`api-keys` 仅能访问模型接口，管理账号池必须使用独立的 `admin-keys`
+- **默认安全设置**：timing-safe key 校验、每 IP 限流、仅允许 localhost 浏览器 CORS
 
 ## 运行要求
 
@@ -63,7 +65,7 @@ node dist/index.js
 
 默认监听地址为 `http://127.0.0.1:8317`。首次启动时，如果 `config.yaml` 中没有配置 API key，会自动生成并写入该文件。
 
-如果上游因为限流导致当前账号进入 cooldown，auth2api 会返回 `429 Rate limited on the configured account`，而不是通用的 `503`。
+如果账号池中所有账号都因为限流临时进入 cooldown，auth2api 会返回 `429 Rate limited on the configured account`，而不是通用的 `503`。
 
 ## 配置
 
@@ -76,7 +78,12 @@ port: 8317
 auth-dir: "~/.auth2api"   # OAuth token 存储目录
 
 api-keys:
-  - "your-api-key-here"   # 客户端使用这个 key 访问代理
+  - "your-api-key-here"   # 客户端访问 /v1/* 的 key（仅能调模型）
+
+# 管理账号池的独立 key，和 api-keys 完全隔离，普通用户 key 无法访问 /admin/*。
+# 留空则 /admin/* 完全不注册，返回 404（与不存在的路径无法区分）。
+admin-keys: []
+  # - "your-admin-key-here"
 
 body-limit: "200mb"       # 最大 JSON 请求体大小，适合大上下文场景
 
@@ -139,15 +146,18 @@ auth2api 额外支持以下便捷别名：
 
 ### 接口列表
 
-| Endpoint | 说明 |
-|----------|------|
-| `POST /v1/chat/completions` | OpenAI 兼容聊天接口 |
-| `POST /v1/responses` | OpenAI Responses API 兼容接口 |
-| `POST /v1/messages` | Claude 原生消息透传 |
-| `POST /v1/messages/count_tokens` | Claude token 计数 |
-| `GET /v1/models` | 列出可用模型 |
-| `GET /admin/accounts` | 查看账号健康状态（需要 API key） |
-| `GET /health` | 健康检查 |
+| Endpoint | 鉴权 | 说明 |
+|----------|------|------|
+| `POST /v1/chat/completions` | `api-keys` | OpenAI 兼容聊天接口 |
+| `POST /v1/responses` | `api-keys` | OpenAI Responses API 兼容接口 |
+| `POST /v1/messages` | `api-keys` | Claude 原生消息透传 |
+| `POST /v1/messages/count_tokens` | `api-keys` | Claude token 计数 |
+| `GET /v1/models` | `api-keys` | 列出可用模型 |
+| `GET /admin/accounts` | `admin-keys` | 查看账号池状态 |
+| `POST /admin/accounts/:email/enable` | `admin-keys` | 手动恢复被禁用的账号 |
+| `GET /health` | 无 | 健康检查 |
+
+未配置 `admin-keys` 时，所有 `/admin/*` 路由不会注册，访问会返回普通的 `404`。
 
 ## Docker
 
@@ -181,24 +191,37 @@ claude
 
 Claude Code 使用的是原生 `/v1/messages` 接口，auth2api 会直接透传。`Authorization: Bearer` 与 `x-api-key` 两种认证头都支持。
 
-## 单账号模式
+## 账号池
 
-当前版本仅支持一个 Claude OAuth 账号。
+auth2api 开箱即支持一个或多个 Claude OAuth 账号。
 
-- 再次执行 `--login` 时，如果还是同一个账号，会更新已保存的 token
-- 如果本地已保存的是另一个账号，auth2api 会拒绝覆盖，并要求你先删除旧 token
-- 如果 token 目录中存在多个 token 文件，auth2api 会直接报错并退出，直到你清理多余文件
+- 为每个账号各执行一次 `--login`。相同邮箱会刷新已保存的 token，新邮箱会追加到账号池。
+- 启动时会自动加载 `auth-dir` 目录下所有 `claude-<email>.json` 文件。
+- 请求走粘性轮询（sticky round-robin）：同一账号会被连续使用 20–60 分钟再切换；当账号进入 cooldown 时会立即切到下一个可用账号。
+- 上游错误（`429`、`401`、`403`、`5xx`、网络错误）按类型分类，触发指数退避 cooldown，账号池继续用剩余账号服务请求。
+- 连续失败达到阈值的账号会被**自动禁用**并跳过，同时输出 `[WARNING]` 日志。恢复方式：通过下方 admin 接口一键恢复，或对该邮箱重新执行 `--login`。
 
-## 管理状态
+## 管理接口
 
-你可以通过 `/admin/accounts` 查看当前账号状态：
+在 `config.yaml` 中配置 `admin-keys` 后才能使用管理 API。未配置时，`/admin/*` 完全不可达，返回 `404`，与不存在的路径无法区分。
+
+查看账号池状态：
 
 ```bash
 curl http://127.0.0.1:8317/admin/accounts \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "Authorization: Bearer <your-admin-key>"
 ```
 
-返回内容包含账号是否可用、cooldown 截止时间、失败计数、最近刷新时间以及基础请求统计。
+返回内容包含每个账号是否可用、`disabled` 标志、cooldown 截止时间、失败计数、最近刷新时间以及基础请求 / token 统计。
+
+无需重启即可恢复被禁用的账号：
+
+```bash
+curl -X POST http://127.0.0.1:8317/admin/accounts/<email>/enable \
+  -H "Authorization: Bearer <your-admin-key>"
+```
+
+`api-keys` 中的 key **无法**访问任何 `/admin/*` 接口，会返回 `403 Invalid admin key`。
 
 ## Smoke 测试
 

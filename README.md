@@ -2,11 +2,11 @@
 
 [中文](./README_CN.md)
 
-A lightweight single-account Claude OAuth to API proxy for Claude Code and OpenAI-compatible clients.
+A lightweight Claude OAuth to API proxy for Claude Code and OpenAI-compatible clients.
 
 auth2api is intentionally small and focused:
 
-- one Claude OAuth account
+- one or more Claude OAuth accounts, automatically rotated
 - one local or self-hosted proxy
 - one simple goal: turn Claude OAuth access into a usable API endpoint
 
@@ -14,14 +14,16 @@ It is not trying to be a multi-provider gateway or a large routing platform. If 
 
 ## Features
 
-- **Lightweight by design** — small codebase, single-account architecture, minimal moving parts
-- **Claude OAuth to API** — use one Claude OAuth login as an API-backed proxy account
+- **Lightweight by design** — small codebase, minimal moving parts
+- **Claude OAuth to API** — use one or more Claude OAuth logins as API-backed proxy accounts
+- **Account pool with auto-rotation** — sticky round-robin across multiple accounts, with exponential-backoff cooldowns on upstream errors
+- **Auto-disable on repeated failures** — a failing account is automatically disabled after consecutive errors and can be re-enabled via an admin endpoint
 - **OpenAI-compatible API** — supports `/v1/chat/completions`, `/v1/responses`, and `/v1/models`
 - **Claude native passthrough** — supports `/v1/messages` and `/v1/messages/count_tokens`
 - **Claude Code friendly** — works with both `Authorization: Bearer` and `x-api-key`
 - **Streaming, tools, images, and reasoning** — covers the main Claude usage patterns without a large framework
-- **Single-account health handling** — cooldown, retry, token refresh, and `/admin/accounts` status
-- **Basic safety defaults** — timing-safe API key validation, per-IP rate limiting, localhost-only browser CORS
+- **Separate usage and admin keys** — `api-keys` grant model access only; `admin-keys` are required to manage the account pool
+- **Basic safety defaults** — timing-safe key validation, per-IP rate limiting, localhost-only browser CORS
 
 ## Requirements
 
@@ -63,7 +65,7 @@ node dist/index.js
 
 The server starts on `http://127.0.0.1:8317` by default. On first run, an API key is auto-generated and saved to `config.yaml`.
 
-If the configured Claude account is temporarily cooled down after upstream rate limiting, auth2api now returns `429 Rate limited on the configured account` instead of a generic `503`.
+If every configured Claude account is temporarily cooled down after upstream rate limiting, auth2api returns `429 Rate limited on the configured account` instead of a generic `503`.
 
 ## Configuration
 
@@ -76,7 +78,13 @@ port: 8317
 auth-dir: "~/.auth2api"   # where OAuth tokens are stored
 
 api-keys:
-  - "your-api-key-here"   # clients use this to authenticate
+  - "your-api-key-here"   # clients use these to call /v1/* (model access only)
+
+# Separate admin keys for /admin/*. Usage keys cannot manage the account pool.
+# Leave empty to disable /admin/* entirely (returns 404, indistinguishable
+# from a non-existent route).
+admin-keys: []
+  # - "your-admin-key-here"
 
 body-limit: "200mb"       # maximum JSON request body size, useful for large-context usage
 
@@ -139,15 +147,18 @@ Short convenience aliases accepted by auth2api:
 
 ### Endpoints
 
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/chat/completions` | OpenAI-compatible chat |
-| `POST /v1/responses` | OpenAI Responses API compatibility |
-| `POST /v1/messages` | Claude native passthrough |
-| `POST /v1/messages/count_tokens` | Claude token counting |
-| `GET /v1/models` | List available models |
-| `GET /admin/accounts` | Account health/status (API key required) |
-| `GET /health` | Health check |
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `POST /v1/chat/completions` | `api-keys` | OpenAI-compatible chat |
+| `POST /v1/responses` | `api-keys` | OpenAI Responses API compatibility |
+| `POST /v1/messages` | `api-keys` | Claude native passthrough |
+| `POST /v1/messages/count_tokens` | `api-keys` | Claude token counting |
+| `GET /v1/models` | `api-keys` | List available models |
+| `GET /admin/accounts` | `admin-keys` | Account pool snapshot |
+| `POST /admin/accounts/:email/enable` | `admin-keys` | Re-enable a disabled account |
+| `GET /health` | none | Health check |
+
+When `admin-keys` is empty, the `/admin/*` routes are unregistered and return a plain `404`.
 
 ## Docker
 
@@ -181,24 +192,37 @@ claude
 
 Claude Code uses the native `/v1/messages` endpoint which auth2api passes through directly. Both `Authorization: Bearer` and `x-api-key` authentication headers are supported.
 
-## Single-account mode
+## Account pool
 
-This proxy supports exactly one Claude OAuth account at a time.
+auth2api supports one or more Claude OAuth accounts out of the box.
 
-- Running `--login` again refreshes the stored token for the same account.
-- If a different account is already stored, auth2api refuses to overwrite it and asks you to remove the existing token first.
-- If more than one token file exists in the auth directory, auth2api exits with an error until you clean up the extra files.
+- Run `--login` once per account. Logging in with an email that is already stored refreshes that account's token; logging in with a new email appends it to the pool.
+- At startup, every `claude-<email>.json` file in the auth directory is loaded into the pool.
+- Requests are routed via sticky round-robin: the current account is reused for 20–60 minutes before rotating, or earlier if the account enters cooldown due to an upstream error.
+- Upstream errors (`429`, `401`, `403`, `5xx`, network failures) are classified and put the affected account on an exponential-backoff cooldown so the pool keeps serving traffic via the remaining accounts.
+- An account that accumulates enough consecutive failures is automatically **disabled** and skipped by the router, with a `[WARNING]` log. A disabled account can be re-enabled via the admin endpoint below or by re-running `--login` for that email.
 
-## Admin status
+## Admin endpoints
 
-Use `/admin/accounts` with your configured API key to inspect the current account state:
+Configure `admin-keys` in `config.yaml` to enable the management API. When `admin-keys` is empty, `/admin/*` is unreachable (returns `404`, identical to a non-existent path).
+
+Inspect the account pool:
 
 ```bash
 curl http://127.0.0.1:8317/admin/accounts \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "Authorization: Bearer <your-admin-key>"
 ```
 
-The response includes account availability, cooldown, failure counters, last refresh time, and basic request statistics.
+The response includes per-account availability, `disabled` flag, cooldown, failure counters, last refresh time, and basic request/token statistics.
+
+Re-enable a disabled account without restarting:
+
+```bash
+curl -X POST http://127.0.0.1:8317/admin/accounts/<email>/enable \
+  -H "Authorization: Bearer <your-admin-key>"
+```
+
+Usage keys from `api-keys` **cannot** access any `/admin/*` endpoint — they receive `403 Invalid admin key`.
 
 ## Smoke tests
 
