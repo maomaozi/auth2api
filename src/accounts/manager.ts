@@ -34,6 +34,59 @@ export interface UsageData {
   cacheReadInputTokens: number;
 }
 
+export interface TrackingContext {
+  apiKeyHash: string;
+  keyPrefix: string;
+  model?: string;
+}
+
+interface ModelUsage {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+}
+
+function createModelUsage(): ModelUsage {
+  return { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 };
+}
+
+interface ApiKeyUsage {
+  keyPrefix: string;
+  totalRequests: number;
+  totalSuccesses: number;
+  totalFailures: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheCreationInputTokens: number;
+  totalCacheReadInputTokens: number;
+  lastUsedAt: string | null;
+  perModel: Map<string, ModelUsage>;
+}
+
+interface ModelUsageSnapshot {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+}
+
+export interface ApiKeyUsageSnapshot {
+  key_hash: string;
+  key_prefix: string;
+  total_requests: number;
+  total_successes: number;
+  total_failures: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_creation_input_tokens: number;
+  total_cache_read_input_tokens: number;
+  last_used_at: string | null;
+  per_model: Record<string, ModelUsageSnapshot>;
+}
+
 interface AccountState {
   token: TokenData;
   cooldownUntil: number;
@@ -113,6 +166,7 @@ interface ProviderPoolState {
 export class AccountManager {
   private accounts: Map<string, AccountState> = new Map();
   private providerPools: Map<ProviderType, ProviderPoolState> = new Map();
+  private apiKeyUsage: Map<string, ApiKeyUsage> = new Map();
   private authDir: string;
   private refreshTimer: NodeJS.Timeout | null = null;
   private statsTimer: NodeJS.Timeout | null = null;
@@ -261,14 +315,51 @@ export class AccountManager {
     return { account: null, total: count };
   }
 
-  recordAttempt(email: string, provider: ProviderType = "claude"): void {
+  private getOrCreateKeyUsage(ctx: TrackingContext): ApiKeyUsage {
+    let usage = this.apiKeyUsage.get(ctx.apiKeyHash);
+    if (!usage) {
+      usage = {
+        keyPrefix: ctx.keyPrefix,
+        totalRequests: 0,
+        totalSuccesses: 0,
+        totalFailures: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheCreationInputTokens: 0,
+        totalCacheReadInputTokens: 0,
+        lastUsedAt: null,
+        perModel: new Map(),
+      };
+      this.apiKeyUsage.set(ctx.apiKeyHash, usage);
+    }
+    return usage;
+  }
+
+  private getOrCreateModelUsage(ku: ApiKeyUsage, model: string): ModelUsage {
+    let mu = ku.perModel.get(model);
+    if (!mu) {
+      mu = createModelUsage();
+      ku.perModel.set(model, mu);
+    }
+    return mu;
+  }
+
+  recordAttempt(email: string, provider: ProviderType = "claude", tracking?: TrackingContext): void {
     const acct = this.accounts.get(accountKey(provider, email));
     if (acct) {
       acct.totalRequests++;
     }
+    if (tracking) {
+      const ku = this.getOrCreateKeyUsage(tracking);
+      ku.totalRequests++;
+      ku.lastUsedAt = new Date().toISOString();
+      if (tracking.model) {
+        this.getOrCreateModelUsage(ku, tracking.model).requests++;
+      }
+    }
   }
 
-  recordSuccess(email: string, provider: ProviderType = "claude"): void {
+  recordSuccess(email: string, provider: ProviderType = "claude", tracking?: TrackingContext): void {
     const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
 
@@ -279,15 +370,37 @@ export class AccountManager {
     acct.lastFailureAt = null;
     acct.lastSuccessAt = new Date().toISOString();
     acct.totalSuccesses++;
+
+    if (tracking) {
+      const ku = this.apiKeyUsage.get(tracking.apiKeyHash);
+      if (ku) ku.totalSuccesses++;
+    }
   }
 
-  recordUsage(email: string, usage: UsageData, provider: ProviderType = "claude"): void {
+  recordUsage(email: string, usage: UsageData, provider: ProviderType = "claude", tracking?: TrackingContext): void {
     const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
     acct.totalInputTokens += usage.inputTokens;
     acct.totalOutputTokens += usage.outputTokens;
     acct.totalCacheCreationInputTokens += usage.cacheCreationInputTokens;
     acct.totalCacheReadInputTokens += usage.cacheReadInputTokens;
+
+    if (tracking) {
+      const ku = this.apiKeyUsage.get(tracking.apiKeyHash);
+      if (ku) {
+        ku.totalInputTokens += usage.inputTokens;
+        ku.totalOutputTokens += usage.outputTokens;
+        ku.totalCacheCreationInputTokens += usage.cacheCreationInputTokens;
+        ku.totalCacheReadInputTokens += usage.cacheReadInputTokens;
+        if (tracking.model) {
+          const mu = this.getOrCreateModelUsage(ku, tracking.model);
+          mu.inputTokens += usage.inputTokens;
+          mu.outputTokens += usage.outputTokens;
+          mu.cacheCreationInputTokens += usage.cacheCreationInputTokens;
+          mu.cacheReadInputTokens += usage.cacheReadInputTokens;
+        }
+      }
+    }
   }
 
   recordFailure(
@@ -295,6 +408,7 @@ export class AccountManager {
     kind: AccountFailureKind,
     detail?: string,
     provider: ProviderType = "claude",
+    tracking?: TrackingContext,
   ): void {
     const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
@@ -303,6 +417,11 @@ export class AccountManager {
     acct.totalFailures++;
     acct.lastFailureAt = new Date().toISOString();
     acct.lastError = detail ? `${kind}: ${detail}` : kind;
+
+    if (tracking) {
+      const ku = this.apiKeyUsage.get(tracking.apiKeyHash);
+      if (ku) ku.totalFailures++;
+    }
 
     // Already disabled: skip cooldown math and log spam.
     if (acct.disabled) return;
@@ -338,6 +457,36 @@ export class AccountManager {
 
     acct.refreshPromise = this.performRefresh(acct);
     return acct.refreshPromise;
+  }
+
+  getApiKeySnapshots(): ApiKeyUsageSnapshot[] {
+    const snapshots: ApiKeyUsageSnapshot[] = [];
+    for (const [hash, ku] of this.apiKeyUsage) {
+      const perModel: ApiKeyUsageSnapshot["per_model"] = {};
+      for (const [model, mu] of ku.perModel) {
+        perModel[model] = {
+          requests: mu.requests,
+          input_tokens: mu.inputTokens,
+          output_tokens: mu.outputTokens,
+          cache_creation_input_tokens: mu.cacheCreationInputTokens,
+          cache_read_input_tokens: mu.cacheReadInputTokens,
+        };
+      }
+      snapshots.push({
+        key_hash: hash,
+        key_prefix: ku.keyPrefix,
+        total_requests: ku.totalRequests,
+        total_successes: ku.totalSuccesses,
+        total_failures: ku.totalFailures,
+        total_input_tokens: ku.totalInputTokens,
+        total_output_tokens: ku.totalOutputTokens,
+        total_cache_creation_input_tokens: ku.totalCacheCreationInputTokens,
+        total_cache_read_input_tokens: ku.totalCacheReadInputTokens,
+        last_used_at: ku.lastUsedAt,
+        per_model: perModel,
+      });
+    }
+    return snapshots;
   }
 
   getSnapshots(): AccountSnapshot[] {
@@ -423,6 +572,20 @@ export class AccountManager {
           `cache_read=${acct.totalCacheReadInputTokens}, ` +
           `total_tokens=${acct.totalInputTokens + acct.totalOutputTokens + acct.totalCacheCreationInputTokens + acct.totalCacheReadInputTokens}`,
       );
+    }
+    if (this.apiKeyUsage.size > 0) {
+      console.log(`  --- Per API Key ---`);
+      for (const [hash, ku] of this.apiKeyUsage) {
+        console.log(
+          `  [${ku.keyPrefix}] (${hash.slice(0, 12)}...): ` +
+            `requests=${ku.totalRequests}, ` +
+            `successes=${ku.totalSuccesses}, ` +
+            `failures=${ku.totalFailures}, ` +
+            `input_tokens=${ku.totalInputTokens}, ` +
+            `output_tokens=${ku.totalOutputTokens}, ` +
+            `total_tokens=${ku.totalInputTokens + ku.totalOutputTokens + ku.totalCacheCreationInputTokens + ku.totalCacheReadInputTokens}`,
+        );
+      }
     }
     console.log(`====================================================\n`);
   }

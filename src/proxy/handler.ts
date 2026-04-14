@@ -1,8 +1,7 @@
-import crypto from "crypto";
 import { Request, Response as ExpressResponse } from "express";
-import { extractApiKey } from "../api-key";
+import { extractApiKeyInfo } from "../api-key";
 import { Config, isDebugLevel } from "../config";
-import { AccountManager, UsageData } from "../accounts/manager";
+import { AccountManager, TrackingContext, UsageData } from "../accounts/manager";
 import { openaiToClaude, claudeToOpenai, resolveModel } from "./translator";
 import { applyCloaking } from "./cloaking";
 import { handleStreamingResponse } from "./streaming";
@@ -76,11 +75,8 @@ export function createChatCompletionsHandler(
       const provider = resolveProvider(rawModel);
       const aliasedModel = resolveModelAlias(rawModel);
       const model = provider === "claude" ? resolveModel(aliasedModel) : aliasedModel;
-      const apiKey = extractApiKey(req.headers);
-      const apiKeyHash = crypto
-        .createHash("sha256")
-        .update(apiKey)
-        .digest("hex");
+      const { apiKey, apiKeyHash, keyPrefix } = extractApiKeyInfo(req.headers);
+      const tracking: TrackingContext = { apiKeyHash, keyPrefix, model };
 
       // Debug
       if (isDebugLevel(config.debug, "verbose")) {
@@ -110,7 +106,7 @@ export function createChatCompletionsHandler(
           return;
         }
 
-        manager.recordAttempt(account.token.email, provider);
+        manager.recordAttempt(account.token.email, provider, tracking);
 
         // Gemini needs per-account projectId; others use precomputed body
         const preparedBody =
@@ -147,7 +143,7 @@ export function createChatCompletionsHandler(
             account.accountUuid,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message, provider);
+          manager.recordFailure(account.token.email, "network", err.message, provider, tracking);
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
               `Attempt ${attempt + 1} network failure (${provider}): ${err.message}`,
@@ -166,12 +162,12 @@ export function createChatCompletionsHandler(
         if (upstreamResp.ok) {
           if (stream) {
             await handleProviderStream(
-              provider, upstreamResp, res, model, account, manager,
+              provider, upstreamResp, res, model, account, manager, tracking,
             );
           } else {
             const respData = await upstreamResp.json();
-            manager.recordSuccess(account.token.email, provider);
-            manager.recordUsage(account.token.email, extractProviderUsage(provider, respData), provider);
+            manager.recordSuccess(account.token.email, provider, tracking);
+            manager.recordUsage(account.token.email, extractProviderUsage(provider, respData), provider, tracking);
             res.json(translateResponse(provider, respData, model));
           }
           return;
@@ -202,6 +198,7 @@ export function createChatCompletionsHandler(
             classifyFailure(lastStatus),
             undefined,
             provider,
+            tracking,
           );
         }
 
@@ -260,12 +257,13 @@ async function handleProviderStream(
   model: string,
   account: { token: { email: string }; accountUuid: string },
   manager: AccountManager,
+  tracking?: TrackingContext,
 ): Promise<void> {
   if (provider === "claude") {
     const streamResult = await handleStreamingResponse(upstreamResp, res, model);
     if (streamResult.completed) {
-      manager.recordSuccess(account.token.email, provider);
-      manager.recordUsage(account.token.email, streamResult.usage, provider);
+      manager.recordSuccess(account.token.email, provider, tracking);
+      manager.recordUsage(account.token.email, streamResult.usage, provider, tracking);
     } else if (!streamResult.clientDisconnected) {
       manager.recordFailure(
         account.token.email, "network",
@@ -361,14 +359,14 @@ async function handleProviderStream(
 
     if (!clientDisconnected) {
       if (!doneSent) res.write("data: [DONE]\n\n");
-      manager.recordSuccess(account.token.email, provider);
+      manager.recordSuccess(account.token.email, provider, tracking);
       // Record usage from stream state
       const usage: UsageData = codexState
         ? { inputTokens: codexState.inputTokens, outputTokens: codexState.outputTokens, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 }
         : geminiState
           ? { inputTokens: geminiState.inputTokens, outputTokens: geminiState.outputTokens, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 }
           : { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 };
-      manager.recordUsage(account.token.email, usage, provider);
+      manager.recordUsage(account.token.email, usage, provider, tracking);
     }
   } catch {
     if (!clientDisconnected) {

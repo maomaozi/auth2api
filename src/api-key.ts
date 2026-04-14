@@ -1,3 +1,11 @@
+import crypto from "crypto";
+
+export interface ApiKeyInfo {
+  apiKey: string;
+  apiKeyHash: string;
+  keyPrefix: string;
+}
+
 export function extractApiKey(headers: {
   authorization?: string;
   "x-api-key"?: string | string[];
@@ -16,4 +24,17 @@ export function extractApiKey(headers: {
   }
 
   return "";
+}
+
+export function extractApiKeyInfo(headers: {
+  authorization?: string;
+  "x-api-key"?: string | string[];
+}): ApiKeyInfo {
+  const apiKey = extractApiKey(headers);
+  const apiKeyHash = crypto
+    .createHash("sha256")
+    .update(apiKey)
+    .digest("hex");
+  const keyPrefix = apiKey.slice(0, 8);
+  return { apiKey, apiKeyHash, keyPrefix };
 }

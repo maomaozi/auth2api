@@ -209,6 +209,13 @@ export function createServer(
       });
     });
 
+    app.get("/admin/usage", (_req, res) => {
+      res.json({
+        keys: manager.getApiKeySnapshots(),
+        generated_at: new Date().toISOString(),
+      });
+    });
+
     app.post("/admin/accounts/:email/enable", (req, res) => {
       const email = req.params.email;
       const provider = req.query.provider as ProviderType | undefined;

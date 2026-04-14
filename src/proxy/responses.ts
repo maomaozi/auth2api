@@ -1,9 +1,8 @@
-import crypto from "crypto";
 import { Request, Response as ExpressResponse } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { extractApiKey } from "../api-key";
+import { extractApiKeyInfo } from "../api-key";
 import { Config, isDebugLevel } from "../config";
-import { AccountManager } from "../accounts/manager";
+import { AccountManager, TrackingContext } from "../accounts/manager";
 import { applyCloaking } from "./cloaking";
 import { resolveModel } from "./translator";
 import { resolveProvider, resolveModelAlias } from "./model-router";
@@ -740,11 +739,8 @@ export function createResponsesHandler(
       const provider = resolveProvider(rawModel);
       const aliasedModel = resolveModelAlias(rawModel);
       const model = provider === "claude" ? resolveModel(aliasedModel) : aliasedModel;
-      const apiKey = extractApiKey(req.headers);
-      const apiKeyHash = crypto
-        .createHash("sha256")
-        .update(apiKey)
-        .digest("hex");
+      const { apiKeyHash, keyPrefix } = extractApiKeyInfo(req.headers);
+      const tracking: TrackingContext = { apiKeyHash, keyPrefix, model };
 
       // Apply resolved model name to body before translation
       const bodyWithModel = { ...body, model };
@@ -779,7 +775,7 @@ export function createResponsesHandler(
           return;
         }
 
-        manager.recordAttempt(account.token.email, provider);
+        manager.recordAttempt(account.token.email, provider, tracking);
 
         // Apply provider-specific body transformations
         let finalBody: any;
@@ -809,7 +805,7 @@ export function createResponsesHandler(
             apiKeyHash,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message, provider);
+          manager.recordFailure(account.token.email, "network", err.message, provider, tracking);
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
               `Responses attempt ${attempt + 1} network failure (${provider}): ${err.message}`,
@@ -885,13 +881,13 @@ export function createResponsesHandler(
                   }
                 }
                 if (!clientDisconnected) {
-                  manager.recordSuccess(account.token.email, provider);
+                  manager.recordSuccess(account.token.email, provider, tracking);
                   manager.recordUsage(account.token.email, {
                     inputTokens: state.inputTokens,
                     outputTokens: state.outputTokens,
                     cacheCreationInputTokens: state.cacheCreationInputTokens,
                     cacheReadInputTokens: state.cacheReadInputTokens,
-                  }, provider);
+                  }, provider, tracking);
                 }
               } catch (err) {
                 if (!clientDisconnected) {
@@ -900,6 +896,7 @@ export function createResponsesHandler(
                     "network",
                     "stream terminated before completion",
                     provider,
+                    tracking,
                   );
                 }
                 if (!clientDisconnected)
@@ -917,7 +914,7 @@ export function createResponsesHandler(
                   res.write(Buffer.from(value));
                 }
                 if (!clientDisconnected) {
-                  manager.recordSuccess(account.token.email, provider);
+                  manager.recordSuccess(account.token.email, provider, tracking);
                 }
               } catch {
                 if (!clientDisconnected) {
@@ -926,6 +923,7 @@ export function createResponsesHandler(
                     "network",
                     "stream terminated before completion",
                     provider,
+                    tracking,
                   );
                 }
               } finally {
@@ -934,8 +932,8 @@ export function createResponsesHandler(
             }
           } else {
             const respData = await upstreamResp.json();
-            manager.recordSuccess(account.token.email, provider);
-            manager.recordUsage(account.token.email, extractUsage(respData), provider);
+            manager.recordSuccess(account.token.email, provider, tracking);
+            manager.recordUsage(account.token.email, extractUsage(respData), provider, tracking);
 
             if (provider === "claude") {
               res.json(claudeToResponses(respData, model));
@@ -968,6 +966,7 @@ export function createResponsesHandler(
             classifyFailure(lastStatus),
             undefined,
             provider,
+            tracking,
           );
         }
         if (!RETRYABLE_STATUSES.has(lastStatus)) break;

@@ -1,8 +1,7 @@
-import crypto from "crypto";
 import { Request, Response as ExpressResponse } from "express";
-import { extractApiKey } from "../api-key";
+import { extractApiKeyInfo } from "../api-key";
 import { Config, isDebugLevel } from "../config";
-import { AccountManager, UsageData } from "../accounts/manager";
+import { AccountManager, TrackingContext, UsageData } from "../accounts/manager";
 import { applyCloaking } from "./cloaking";
 import { callClaudeAPI, callClaudeCountTokens } from "./claude-api";
 import {
@@ -38,11 +37,9 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
       }
 
       const stream = !!body.stream;
-      const apiKey = extractApiKey(req.headers);
-      const apiKeyHash = crypto
-        .createHash("sha256")
-        .update(apiKey)
-        .digest("hex");
+      const model = body.model || "unknown";
+      const { apiKey, apiKeyHash, keyPrefix } = extractApiKeyInfo(req.headers);
+      const tracking: TrackingContext = { apiKeyHash, keyPrefix, model };
 
       // When request comes from claude-cli, pass through anthropic-* and session headers
       const userAgent = req.headers["user-agent"] || "";
@@ -77,7 +74,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
           return;
         }
 
-        manager.recordAttempt(account.token.email, "claude");
+        manager.recordAttempt(account.token.email, "claude", tracking);
 
         // Apply per-account cloaking (clone body so each attempt is fresh)
         const claudeBody = applyCloaking(
@@ -107,7 +104,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
             passthroughHeaders,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message, "claude");
+          manager.recordFailure(account.token.email, "network", err.message, "claude", tracking);
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
               `Messages attempt ${attempt + 1} network failure: ${err.message}`,
@@ -188,8 +185,8 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
                 }
               }
               if (!clientDisconnected) {
-                manager.recordSuccess(account.token.email, "claude");
-                manager.recordUsage(account.token.email, usage, "claude");
+                manager.recordSuccess(account.token.email, "claude", tracking);
+                manager.recordUsage(account.token.email, usage, "claude", tracking);
               }
             } catch (err) {
               if (!clientDisconnected) {
@@ -198,6 +195,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
                   "network",
                   "stream terminated before completion",
                   "claude",
+                  tracking,
                 );
               }
               if (!clientDisconnected) console.error("Stream pipe error:", err);
@@ -207,8 +205,8 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
           } else {
             // Forward JSON response directly
             const data = await upstreamResp.json();
-            manager.recordSuccess(account.token.email, "claude");
-            manager.recordUsage(account.token.email, extractUsage(data), "claude");
+            manager.recordSuccess(account.token.email, "claude", tracking);
+            manager.recordUsage(account.token.email, extractUsage(data), "claude", tracking);
             res.json(data);
           }
           return;
@@ -239,6 +237,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
             classifyFailure(lastStatus),
             undefined,
             "claude",
+            tracking,
           );
         }
         if (!RETRYABLE_STATUSES.has(lastStatus)) break;
@@ -264,11 +263,8 @@ export function createCountTokensHandler(
 ) {
   return async (req: Request, res: ExpressResponse): Promise<void> => {
     try {
-      const apiKey = extractApiKey(req.headers);
-      const apiKeyHash = crypto
-        .createHash("sha256")
-        .update(apiKey)
-        .digest("hex");
+      const { apiKeyHash, keyPrefix } = extractApiKeyInfo(req.headers);
+      const tracking: TrackingContext = { apiKeyHash, keyPrefix };
 
       let lastStatus = 500;
       let lastErrBody = "";
@@ -285,7 +281,7 @@ export function createCountTokensHandler(
           return;
         }
 
-        manager.recordAttempt(account.token.email, "claude");
+        manager.recordAttempt(account.token.email, "claude", tracking);
 
         let upstreamResp: globalThis.Response;
         try {
@@ -297,7 +293,7 @@ export function createCountTokensHandler(
             apiKeyHash,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message, "claude");
+          manager.recordFailure(account.token.email, "network", err.message, "claude", tracking);
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
               `Count tokens attempt ${attempt + 1} network failure: ${err.message}`,
@@ -314,7 +310,7 @@ export function createCountTokensHandler(
         }
 
         if (upstreamResp.ok) {
-          manager.recordSuccess(account.token.email, "claude");
+          manager.recordSuccess(account.token.email, "claude", tracking);
           const data = await upstreamResp.json();
           res.json(data);
           return;
@@ -335,6 +331,7 @@ export function createCountTokensHandler(
             classifyFailure(lastStatus),
             undefined,
             "claude",
+            tracking,
           );
         }
 
