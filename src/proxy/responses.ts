@@ -3,32 +3,20 @@ import { Request, Response as ExpressResponse } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { extractApiKey } from "../api-key";
 import { Config, isDebugLevel } from "../config";
-import {
-  AccountFailureKind,
-  AccountManager,
-  UsageData,
-} from "../accounts/manager";
+import { AccountManager } from "../accounts/manager";
 import { applyCloaking } from "./cloaking";
-import { callClaudeAPI } from "./claude-api";
 import { resolveModel } from "./translator";
-
-const MAX_RETRIES = 3;
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
-
-function classifyFailure(status: number): AccountFailureKind {
-  if (status === 429) return "rate_limit";
-  if (status === 401) return "auth";
-  if (status === 403) return "forbidden";
-  return "server";
-}
-
-const EFFORT_TO_BUDGET: Record<string, number> = {
-  none: 0,
-  low: 1024,
-  medium: 8192,
-  high: 24576,
-  xhigh: 32768,
-};
+import { resolveProvider, resolveModelAlias } from "./model-router";
+import {
+  MAX_RETRIES,
+  RETRYABLE_STATUSES,
+  classifyFailure,
+  extractUsage,
+  sendUpstreamError,
+  callUpstream,
+  EFFORT_TO_BUDGET,
+} from "./shared";
+import { openaiToGeminiCLI } from "./gemini-translator";
 
 // ── OpenAI Responses API request → Claude Messages request ──
 
@@ -147,6 +135,101 @@ function responsesToClaude(body: any): any {
 
   claudeBody.messages = messages;
   return claudeBody;
+}
+
+// ── OpenAI Responses API request → OpenAI Chat Completions request ──
+
+function responsesToOpenAI(body: any): any {
+  const openaiBody: any = {
+    model: body.model,
+    max_tokens: body.max_output_tokens || 4096,
+    stream: !!body.stream,
+  };
+
+  if (body.temperature !== undefined) openaiBody.temperature = body.temperature;
+  if (body.top_p !== undefined) openaiBody.top_p = body.top_p;
+
+  // reasoning.effort → reasoning_effort
+  if (body.reasoning?.effort) {
+    openaiBody.reasoning_effort = body.reasoning.effort;
+  }
+
+  // Build messages from input[]
+  const messages: any[] = [];
+
+  // instructions → system message
+  if (body.instructions) {
+    messages.push({ role: "system", content: body.instructions });
+  }
+
+  for (const item of body.input || []) {
+    const role = item.role;
+
+    if (role === "system") {
+      messages.push({ role: "system", content: extractText(item.content) });
+      continue;
+    }
+
+    // function_call_output → tool message
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content:
+          typeof item.output === "string"
+            ? item.output
+            : JSON.stringify(item.output),
+      });
+      continue;
+    }
+
+    // function_call → assistant message with tool_calls
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id || item.id,
+            type: "function",
+            function: {
+              name: item.name,
+              arguments: item.arguments || "{}",
+            },
+          },
+        ],
+      });
+      continue;
+    }
+
+    if (role === "user" || role === "assistant") {
+      if (typeof item.content === "string") {
+        messages.push({ role, content: item.content });
+      } else if (Array.isArray(item.content)) {
+        messages.push({ role, content: item.content });
+      }
+    }
+  }
+
+  openaiBody.messages = messages;
+
+  // Tools
+  if (Array.isArray(body.tools)) {
+    openaiBody.tools = body.tools.map((t: any) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description || "",
+        parameters: t.parameters || t.input_schema || { type: "object", properties: {} },
+      },
+    }));
+  }
+
+  if (body.tool_choice) {
+    openaiBody.tool_choice = body.tool_choice;
+  }
+
+  return openaiBody;
 }
 
 function extractText(content: any): string {
@@ -273,6 +356,72 @@ function claudeToResponses(claudeResp: any, model: string): any {
       total_tokens:
         (claudeResp.usage?.input_tokens || 0) +
         (claudeResp.usage?.output_tokens || 0),
+    },
+  };
+}
+
+// ── OpenAI chat completion response → OpenAI Responses API format ──
+
+function openaiChatToResponses(chatResp: any, model: string): any {
+  const respId = `resp_${uuidv4().replace(/-/g, "")}`;
+  const msgId = `msg_${uuidv4().replace(/-/g, "")}`;
+  const createdAt = Math.floor(Date.now() / 1000);
+
+  const choice = chatResp.choices?.[0];
+  const msg = choice?.message;
+
+  const output: any[] = [];
+
+  // Text content
+  const contentParts: any[] = [];
+  if (msg?.content) {
+    contentParts.push({
+      type: "output_text",
+      text: msg.content,
+      annotations: [],
+    });
+  }
+
+  // Tool calls
+  const toolCalls: any[] = [];
+  if (msg?.tool_calls) {
+    for (const tc of msg.tool_calls) {
+      toolCalls.push({
+        type: "function_call",
+        id: `fc_${tc.id}`,
+        call_id: tc.id,
+        name: tc.function?.name || "",
+        arguments: tc.function?.arguments || "{}",
+        status: "completed",
+      });
+    }
+  }
+
+  if (contentParts.length) {
+    output.push({
+      type: "message",
+      id: msgId,
+      role: "assistant",
+      status: "completed",
+      content: contentParts,
+    });
+  }
+  output.push(...toolCalls);
+
+  const finishReason = choice?.finish_reason;
+  const status = finishReason === "length" ? "incomplete" : "completed";
+
+  return {
+    id: respId,
+    object: "response",
+    created_at: createdAt,
+    status,
+    model,
+    output,
+    usage: {
+      input_tokens: chatResp.usage?.prompt_tokens || 0,
+      output_tokens: chatResp.usage?.completion_tokens || 0,
+      total_tokens: chatResp.usage?.total_tokens || 0,
     },
   };
 }
@@ -587,56 +736,83 @@ export function createResponsesHandler(
       }
 
       const stream = !!body.stream;
-      const model = resolveModel(body.model || "claude-sonnet-4-6");
+      const rawModel = body.model || "claude-sonnet-4-6";
+      const provider = resolveProvider(rawModel);
+      const aliasedModel = resolveModelAlias(rawModel);
+      const model = provider === "claude" ? resolveModel(aliasedModel) : aliasedModel;
       const apiKey = extractApiKey(req.headers);
       const apiKeyHash = crypto
         .createHash("sha256")
         .update(apiKey)
         .digest("hex");
 
-      const translatedBody = responsesToClaude(body);
+      // Apply resolved model name to body before translation
+      const bodyWithModel = { ...body, model };
+
+      // Prepare body for the target provider
+      // - Claude: translate Responses API → Claude Messages format
+      // - Codex: pass Responses API format directly (Codex endpoint accepts it natively)
+      // - Gemini: translate Responses API → OpenAI Chat Completions → Gemini native (via handler)
+      let translatedBody: any;
+      if (provider === "claude") {
+        translatedBody = responsesToClaude(bodyWithModel);
+      } else if (provider === "codex") {
+        // Codex endpoint natively accepts Responses API format
+        translatedBody = bodyWithModel;
+      } else {
+        // Gemini: convert to chat completions, then Gemini translator handles the rest
+        translatedBody = responsesToOpenAI(bodyWithModel);
+      }
 
       let lastStatus = 500;
       let lastErrBody = "";
       const refreshedAccounts = new Set<string>();
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const { account, total } = manager.getNextAccount();
+        const { account, total } = manager.getNextAccount(provider);
         if (!account) {
           const status = total === 0 ? 503 : 429;
           const message =
             total === 0
-              ? "No available account"
-              : "Rate limited on the configured account";
+              ? `No available ${provider} account`
+              : `Rate limited on the configured ${provider} account`;
           res.status(status).json({ error: { message } });
           return;
         }
 
-        manager.recordAttempt(account.token.email);
+        manager.recordAttempt(account.token.email, provider);
 
-        // Apply per-account cloaking (clone body so each attempt is fresh)
-        const claudeBody = applyCloaking(
-          structuredClone(translatedBody),
-          account.deviceId,
-          account.accountUuid,
-          apiKeyHash,
-          config.cloaking,
-        );
+        // Apply provider-specific body transformations
+        let finalBody: any;
+        if (provider === "claude") {
+          finalBody = applyCloaking(
+            structuredClone(translatedBody),
+            account.deviceId,
+            account.accountUuid,
+            apiKeyHash,
+            config.cloaking,
+          );
+        } else if (provider === "gemini") {
+          // Wrap Chat Completions body in Gemini CLI envelope with project ID
+          finalBody = openaiToGeminiCLI(translatedBody, account.projectId);
+        } else {
+          finalBody = translatedBody;
+        }
 
         let upstreamResp: globalThis.Response;
         try {
-          upstreamResp = await callClaudeAPI(
+          upstreamResp = await callUpstream(
+            provider,
             account.token.accessToken,
-            claudeBody,
+            finalBody,
             stream,
-            config.timeouts,
-            config.cloaking,
+            config,
             apiKeyHash,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message);
+          manager.recordFailure(account.token.email, "network", err.message, provider);
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
-              `Responses attempt ${attempt + 1} network failure: ${err.message}`,
+              `Responses attempt ${attempt + 1} network failure (${provider}): ${err.message}`,
             );
           }
           if (attempt < MAX_RETRIES - 1) {
@@ -663,82 +839,110 @@ export function createResponsesHandler(
               return;
             }
 
-            const state = makeResponsesState();
-            const decoder = new TextDecoder();
-            let buffer = "";
             let clientDisconnected = false;
             res.on("close", () => {
               clientDisconnected = true;
               reader.cancel().catch(() => {});
             });
 
-            try {
-              while (!clientDisconnected) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
+            if (provider === "claude") {
+              // Claude SSE → Responses API SSE translation
+              const state = makeResponsesState();
+              const decoder = new TextDecoder();
+              let buffer = "";
 
-                const lines = buffer.split("\n");
-                buffer = lines.pop() ?? "";
+              try {
+                while (!clientDisconnected) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
 
-                let currentEvent = "";
-                for (const line of lines) {
-                  if (line.startsWith("event:")) {
-                    currentEvent = line.slice(6).trim();
-                  } else if (line.startsWith("data:")) {
-                    const raw = line.slice(5).trim();
-                    if (!raw || raw === "[DONE]") continue;
-                    try {
-                      const data = JSON.parse(raw);
-                      const chunks = claudeSSEToResponses(
-                        currentEvent,
-                        data,
-                        state,
-                        model,
-                      );
-                      for (const chunk of chunks) {
-                        if (!clientDisconnected) res.write(chunk);
+                  const lines = buffer.split("\n");
+                  buffer = lines.pop() ?? "";
+
+                  let currentEvent = "";
+                  for (const line of lines) {
+                    if (line.startsWith("event:")) {
+                      currentEvent = line.slice(6).trim();
+                    } else if (line.startsWith("data:")) {
+                      const raw = line.slice(5).trim();
+                      if (!raw || raw === "[DONE]") continue;
+                      try {
+                        const data = JSON.parse(raw);
+                        const chunks = claudeSSEToResponses(
+                          currentEvent,
+                          data,
+                          state,
+                          model,
+                        );
+                        for (const chunk of chunks) {
+                          if (!clientDisconnected) res.write(chunk);
+                        }
+                      } catch {
+                        /* ignore parse errors */
                       }
-                    } catch {
-                      /* ignore parse errors */
                     }
                   }
                 }
+                if (!clientDisconnected) {
+                  manager.recordSuccess(account.token.email, provider);
+                  manager.recordUsage(account.token.email, {
+                    inputTokens: state.inputTokens,
+                    outputTokens: state.outputTokens,
+                    cacheCreationInputTokens: state.cacheCreationInputTokens,
+                    cacheReadInputTokens: state.cacheReadInputTokens,
+                  }, provider);
+                }
+              } catch (err) {
+                if (!clientDisconnected) {
+                  manager.recordFailure(
+                    account.token.email,
+                    "network",
+                    "stream terminated before completion",
+                    provider,
+                  );
+                }
+                if (!clientDisconnected)
+                  console.error("Responses stream error:", err);
+              } finally {
+                if (!clientDisconnected) res.end();
               }
-              if (!clientDisconnected) {
-                manager.recordSuccess(account.token.email);
-                manager.recordUsage(account.token.email, {
-                  inputTokens: state.inputTokens,
-                  outputTokens: state.outputTokens,
-                  cacheCreationInputTokens: state.cacheCreationInputTokens,
-                  cacheReadInputTokens: state.cacheReadInputTokens,
-                });
+            } else {
+              // Codex/Gemini: OpenAI SSE → pipe directly (already OpenAI format)
+              // Clients calling /v1/responses with Codex/Gemini get raw OpenAI SSE
+              try {
+                while (!clientDisconnected) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  res.write(Buffer.from(value));
+                }
+                if (!clientDisconnected) {
+                  manager.recordSuccess(account.token.email, provider);
+                }
+              } catch {
+                if (!clientDisconnected) {
+                  manager.recordFailure(
+                    account.token.email,
+                    "network",
+                    "stream terminated before completion",
+                    provider,
+                  );
+                }
+              } finally {
+                if (!clientDisconnected) res.end();
               }
-            } catch (err) {
-              if (!clientDisconnected) {
-                manager.recordFailure(
-                  account.token.email,
-                  "network",
-                  "stream terminated before completion",
-                );
-              }
-              if (!clientDisconnected)
-                console.error("Responses stream error:", err);
-            } finally {
-              if (!clientDisconnected) res.end();
             }
           } else {
-            const claudeResp = await upstreamResp.json();
-            manager.recordSuccess(account.token.email);
-            manager.recordUsage(account.token.email, {
-              inputTokens: claudeResp.usage?.input_tokens || 0,
-              outputTokens: claudeResp.usage?.output_tokens || 0,
-              cacheCreationInputTokens:
-                claudeResp.usage?.cache_creation_input_tokens || 0,
-              cacheReadInputTokens:
-                claudeResp.usage?.cache_read_input_tokens || 0,
-            });
-            res.json(claudeToResponses(claudeResp, model));
+            const respData = await upstreamResp.json();
+            manager.recordSuccess(account.token.email, provider);
+            manager.recordUsage(account.token.email, extractUsage(respData), provider);
+
+            if (provider === "claude") {
+              res.json(claudeToResponses(respData, model));
+            } else {
+              // Convert OpenAI chat completion response → Responses API format
+              res.json(openaiChatToResponses(respData, model));
+            }
           }
           return;
         }
@@ -747,12 +951,12 @@ export function createResponsesHandler(
         lastErrBody = await upstreamResp.text().catch(() => "");
         if (isDebugLevel(config.debug, "errors")) {
           console.error(
-            `Responses attempt ${attempt + 1} failed (${lastStatus}): ${lastErrBody}`,
+            `Responses attempt ${attempt + 1} failed (${provider}, ${lastStatus}): ${lastErrBody}`,
           );
         }
 
         if (lastStatus === 401) {
-          const refreshed = await manager.refreshAccount(account.token.email);
+          const refreshed = await manager.refreshAccount(account.token.email, provider);
           if (refreshed && !refreshedAccounts.has(account.token.email)) {
             refreshedAccounts.add(account.token.email);
             attempt--;
@@ -762,6 +966,8 @@ export function createResponsesHandler(
           manager.recordFailure(
             account.token.email,
             classifyFailure(lastStatus),
+            undefined,
+            provider,
           );
         }
         if (!RETRYABLE_STATUSES.has(lastStatus)) break;
@@ -770,20 +976,7 @@ export function createResponsesHandler(
         }
       }
 
-      try {
-        const parsed = lastErrBody ? JSON.parse(lastErrBody) : null;
-        if (parsed && typeof parsed === "object") {
-          res.status(lastStatus).json(parsed);
-        } else {
-          res
-            .status(lastStatus)
-            .json({ error: { message: "Upstream request failed" } });
-        }
-      } catch {
-        res
-          .status(lastStatus)
-          .json({ error: { message: "Upstream request failed" } });
-      }
+      sendUpstreamError(res, lastStatus, lastErrBody);
     } catch (err: any) {
       console.error("Responses handler error:", err.message);
       res.status(500).json({ error: { message: "Internal server error" } });

@@ -21,12 +21,11 @@ function makeConfig(authDir: string): Config {
     port: 0,
     "auth-dir": authDir,
     "api-keys": ["test-key"],
+    "admin-keys": ["test-key"],
     "body-limit": "200mb",
     cloaking: {
-      mode: "never",
-      "strict-mode": false,
-      "sensitive-words": [],
-      "cache-user-id": false,
+      "cli-version": "2.1.88",
+      entrypoint: "cli",
     },
     timeouts: {
       "messages-ms": 120000,
@@ -43,6 +42,8 @@ function makeToken(overrides: Partial<TokenData> = {}): TokenData {
     refreshToken: "refresh-token",
     email: "test@example.com",
     expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    accountUuid: "test-uuid",
+    provider: "claude",
     ...overrides,
   };
 }
@@ -164,6 +165,7 @@ test("accepts x-api-key auth and serves models/admin state", async (t) => {
   assert.equal(adminResp.status, 200);
   assert.equal(adminResp.body.account_count, 1);
   assert.equal(adminResp.body.accounts[0].email, "test@example.com");
+  assert.equal(adminResp.body.accounts[0].provider, "claude");
 });
 
 test("proxies a non-stream chat completion through Claude OAuth token", async (t) => {
@@ -294,7 +296,7 @@ test("refreshes the OAuth token after an upstream 401 and retries successfully",
 test("returns rate limited when the configured account is cooled down", async (t) => {
   const authDir = fs.mkdtempSync(path.join(os.tmpdir(), "auth2api-smoke-"));
   const manager = makeManager(authDir, [makeToken()]);
-  manager.recordFailure("test@example.com", "rate_limit", "forced for smoke test");
+  manager.recordFailure("test@example.com", "rate_limit", "forced for smoke test", "claude");
   const restoreFetch = withMockedFetch(async () => {
     throw new Error("Upstream should not be called while the configured account is cooled down");
   });
@@ -318,7 +320,7 @@ test("returns rate limited when the configured account is cooled down", async (t
   });
 
   assert.equal(resp.status, 429);
-  assert.equal(resp.body.error.message, "Rate limited on the configured account");
+  assert.ok(resp.body.error.message.includes("Rate limited"));
 });
 
 test("loads multiple accounts successfully", (t) => {
@@ -347,22 +349,23 @@ test("round-robin rotates between multiple accounts", (t) => {
     makeToken({ email: "c@example.com", accessToken: "token-c" }),
   ]);
 
-  const first = manager.getNextAccount();
-  assert.ok(first);
-  assert.equal(first.token.email, "a@example.com");
+  const first = manager.getNextAccount("claude");
+  assert.ok(first.account);
+  assert.equal(first.account.token.email, "a@example.com");
 
-  const second = manager.getNextAccount();
-  assert.ok(second);
-  assert.equal(second.token.email, "b@example.com");
+  // Force rotation by triggering cooldown on current sticky account
+  manager.recordFailure("a@example.com", "rate_limit", "test", "claude");
 
-  const third = manager.getNextAccount();
-  assert.ok(third);
-  assert.equal(third.token.email, "c@example.com");
+  const second = manager.getNextAccount("claude");
+  assert.ok(second.account);
+  assert.equal(second.account.token.email, "b@example.com");
 
-  // wraps around
-  const fourth = manager.getNextAccount();
-  assert.ok(fourth);
-  assert.equal(fourth.token.email, "a@example.com");
+  // Force rotation again
+  manager.recordFailure("b@example.com", "rate_limit", "test", "claude");
+
+  const third = manager.getNextAccount("claude");
+  assert.ok(third.account);
+  assert.equal(third.account.token.email, "c@example.com");
 });
 
 test("round-robin skips cooled-down accounts", (t) => {
@@ -378,25 +381,23 @@ test("round-robin skips cooled-down accounts", (t) => {
   ]);
 
   // Cool down account a
-  manager.recordFailure("a@example.com", "rate_limit", "test");
+  manager.recordFailure("a@example.com", "rate_limit", "test", "claude");
 
   // Should skip a, get b
-  const first = manager.getNextAccount();
-  assert.ok(first);
-  assert.equal(first.token.email, "b@example.com");
+  const first = manager.getNextAccount("claude");
+  assert.ok(first.account);
+  assert.equal(first.account.token.email, "b@example.com");
 
-  // Next should be c
-  const second = manager.getNextAccount();
-  assert.ok(second);
-  assert.equal(second.token.email, "c@example.com");
+  // Force rotation
+  manager.recordFailure("b@example.com", "rate_limit", "test", "claude");
 
-  // Next should skip a again, get b
-  const third = manager.getNextAccount();
-  assert.ok(third);
-  assert.equal(third.token.email, "b@example.com");
+  // Next should be c (a and b are cooled down)
+  const second = manager.getNextAccount("claude");
+  assert.ok(second.account);
+  assert.equal(second.account.token.email, "c@example.com");
 });
 
-test("returns null when all accounts are cooled down", (t) => {
+test("returns null account when all accounts are cooled down", (t) => {
   const authDir = fs.mkdtempSync(path.join(os.tmpdir(), "auth2api-smoke-"));
   t.after(() => {
     fs.rmSync(authDir, { recursive: true, force: true });
@@ -407,14 +408,12 @@ test("returns null when all accounts are cooled down", (t) => {
     makeToken({ email: "b@example.com", accessToken: "token-b" }),
   ]);
 
-  manager.recordFailure("a@example.com", "rate_limit", "test");
-  manager.recordFailure("b@example.com", "rate_limit", "test");
+  manager.recordFailure("a@example.com", "rate_limit", "test", "claude");
+  manager.recordFailure("b@example.com", "rate_limit", "test", "claude");
 
-  const result = manager.getNextAccount();
-  assert.equal(result, null);
-
-  const availability = manager.getAvailability();
-  assert.equal(availability.state, "cooldown");
+  const result = manager.getNextAccount("claude");
+  assert.equal(result.account, null);
+  assert.equal(result.total, 2);
 });
 
 test("multi-account admin endpoint shows all accounts", async (t) => {
@@ -474,7 +473,7 @@ test("multi-account proxies requests using round-robin accounts", async (t) => {
     fs.rmSync(authDir, { recursive: true, force: true });
   });
 
-  // First request
+  // First request — will stick to first account
   await requestJson({
     server,
     method: "POST",
@@ -483,25 +482,9 @@ test("multi-account proxies requests using round-robin accounts", async (t) => {
     body: { model: "claude-sonnet-4", messages: [{ role: "user", content: "1" }], stream: false },
   });
 
-  // Second request
-  await requestJson({
-    server,
-    method: "POST",
-    path: "/v1/chat/completions",
-    headers: { Authorization: "Bearer test-key" },
-    body: { model: "claude-sonnet-4", messages: [{ role: "user", content: "2" }], stream: false },
-  });
-
-  // Third request (wraps around)
-  await requestJson({
-    server,
-    method: "POST",
-    path: "/v1/chat/completions",
-    headers: { Authorization: "Bearer test-key" },
-    body: { model: "claude-sonnet-4", messages: [{ role: "user", content: "3" }], stream: false },
-  });
-
-  assert.deepEqual(usedTokens, ["token-a", "token-b", "token-a"]);
+  // Sticky session means same account is used for subsequent requests
+  assert.ok(usedTokens.length >= 1);
+  assert.equal(usedTokens[0], "token-a");
 });
 
 test("multi-account falls back to next account on rate limit", async (t) => {

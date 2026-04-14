@@ -9,16 +9,35 @@ import {
   createCountTokensHandler,
 } from "./proxy/passthrough";
 import { createResponsesHandler } from "./proxy/responses";
+import { ProviderType } from "./auth/provider-interface";
 
-const SUPPORTED_MODELS = [
-  "claude-opus-4-6",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001",
-  "claude-haiku-4-5",
-  "opus",
-  "sonnet",
-  "haiku",
-] as const;
+/** Models per provider for the /v1/models endpoint */
+const PROVIDER_MODELS: Record<ProviderType, { id: string; owned_by: string }[]> = {
+  claude: [
+    { id: "claude-opus-4-6", owned_by: "anthropic" },
+    { id: "claude-sonnet-4-6", owned_by: "anthropic" },
+    { id: "claude-haiku-4-5-20251001", owned_by: "anthropic" },
+    { id: "claude-haiku-4-5", owned_by: "anthropic" },
+    { id: "opus", owned_by: "anthropic" },
+    { id: "sonnet", owned_by: "anthropic" },
+    { id: "haiku", owned_by: "anthropic" },
+  ],
+  codex: [
+    { id: "gpt-4o", owned_by: "openai" },
+    { id: "gpt-4o-mini", owned_by: "openai" },
+    { id: "gpt-4.1", owned_by: "openai" },
+    { id: "gpt-4.1-mini", owned_by: "openai" },
+    { id: "gpt-4.1-nano", owned_by: "openai" },
+    { id: "o3", owned_by: "openai" },
+    { id: "o3-mini", owned_by: "openai" },
+    { id: "o4-mini", owned_by: "openai" },
+  ],
+  gemini: [
+    { id: "gemini-2.5-pro", owned_by: "google" },
+    { id: "gemini-2.5-flash", owned_by: "google" },
+    { id: "gemini-2.0-flash", owned_by: "google" },
+  ],
+};
 
 // Timing-safe API key comparison
 function safeCompare(a: string, b: string): boolean {
@@ -143,30 +162,37 @@ export function createServer(
     app.use("/admin", makeKeyAuth(config["admin-keys"], "admin key"));
   }
 
-  // Routes — OpenAI compatible
+  // Routes — OpenAI compatible (supports all providers via model routing)
   app.post(
     "/v1/chat/completions",
     createChatCompletionsHandler(config, manager),
   );
   app.post("/v1/responses", createResponsesHandler(config, manager));
 
-  // Routes — Claude native passthrough
+  // Routes — Claude native passthrough (Claude only)
   app.post(
     "/v1/messages/count_tokens",
     createCountTokensHandler(config, manager),
   );
   app.post("/v1/messages", createMessagesHandler(config, manager));
 
+  // Models endpoint — returns models for all active providers
   app.get("/v1/models", (_req, res) => {
-    res.json({
-      object: "list",
-      data: SUPPORTED_MODELS.map((id) => ({
-        id,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "anthropic",
-      })),
-    });
+    const activeProviders = manager.getActiveProviders();
+    const now = Math.floor(Date.now() / 1000);
+    const models: any[] = [];
+    for (const provider of activeProviders) {
+      const providerModels = PROVIDER_MODELS[provider] || [];
+      for (const m of providerModels) {
+        models.push({
+          id: m.id,
+          object: "model",
+          created: now,
+          owned_by: m.owned_by,
+        });
+      }
+    }
+    res.json({ object: "list", data: models });
   });
 
   // Health check (no account count to avoid info leak)
@@ -185,8 +211,10 @@ export function createServer(
 
     app.post("/admin/accounts/:email/enable", (req, res) => {
       const email = req.params.email;
-      if (manager.enableAccount(email)) {
-        res.json({ message: `Account ${email} re-enabled` });
+      const provider = req.query.provider as ProviderType | undefined;
+      if (manager.enableAccount(email, provider)) {
+        const label = provider ? `${email} (${provider})` : email;
+        res.json({ message: `Account ${label} re-enabled` });
       } else {
         res
           .status(404)

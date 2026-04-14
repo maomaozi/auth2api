@@ -1,9 +1,9 @@
 import { TokenData } from "../auth/types";
-import { refreshTokensWithRetry } from "../auth/oauth";
+import { ProviderType, refreshTokensWithRetry } from "../auth/provider-interface";
+import { getAuthProvider } from "../auth/providers";
 import { saveToken, loadAllTokens } from "../auth/token-storage";
 import { getDeviceId } from "../proxy/cloak-utils";
 
-const REFRESH_LEAD_MS = 4 * 60 * 60 * 1000; // 4 hours before expiry
 const REFRESH_CHECK_INTERVAL_MS = 60 * 1000; // check every 60s
 
 // Disable an account after this many consecutive failures
@@ -56,6 +56,7 @@ interface AccountState {
 
 export interface AccountSnapshot {
   email: string;
+  provider: ProviderType;
   available: boolean;
   disabled: boolean;
   cooldownUntil: number;
@@ -80,6 +81,7 @@ export interface AccountResult {
     token: TokenData;
     deviceId: string;
     accountUuid: string;
+    projectId: string;
   } | null;
   total: number;
 }
@@ -91,11 +93,26 @@ function randomStickyDuration(): number {
   return STICKY_MIN_MS + Math.random() * (STICKY_MAX_MS - STICKY_MIN_MS);
 }
 
+/**
+ * Unique key for an account. Uses provider + email since the same email
+ * could have accounts on multiple providers.
+ */
+function accountKey(provider: ProviderType, email: string): string {
+  return `${provider}:${email}`;
+}
+
+/**
+ * Per-provider round-robin state.
+ */
+interface ProviderPoolState {
+  accountOrder: string[]; // account keys in insertion order
+  lastUsedIndex: number;
+  stickyUntil: number;
+}
+
 export class AccountManager {
   private accounts: Map<string, AccountState> = new Map();
-  private accountOrder: string[] = []; // emails in insertion order for round-robin
-  private lastUsedIndex: number = -1;
-  private stickyUntil: number = 0; // timestamp until which current account is sticky
+  private providerPools: Map<ProviderType, ProviderPoolState> = new Map();
   private authDir: string;
   private refreshTimer: NodeJS.Timeout | null = null;
   private statsTimer: NodeJS.Timeout | null = null;
@@ -105,17 +122,35 @@ export class AccountManager {
     this.authDir = authDir;
   }
 
+  private getOrCreatePool(provider: ProviderType): ProviderPoolState {
+    let pool = this.providerPools.get(provider);
+    if (!pool) {
+      pool = { accountOrder: [], lastUsedIndex: -1, stickyUntil: 0 };
+      this.providerPools.set(provider, pool);
+    }
+    return pool;
+  }
+
   load(): void {
     const tokens = loadAllTokens(this.authDir);
     for (const token of tokens) {
-      this.accounts.set(token.email, this.createAccountState(token));
-      this.accountOrder.push(token.email);
+      const key = accountKey(token.provider, token.email);
+      this.accounts.set(key, this.createAccountState(token));
+      const pool = this.getOrCreatePool(token.provider);
+      if (!pool.accountOrder.includes(key)) {
+        pool.accountOrder.push(key);
+      }
     }
-    console.log(`Loaded ${this.accounts.size} account(s)`);
+    // Log counts per provider
+    for (const [provider, pool] of this.providerPools) {
+      console.log(`Loaded ${pool.accountOrder.length} ${provider} account(s)`);
+    }
+    console.log(`Total: ${this.accounts.size} account(s)`);
   }
 
   addAccount(token: TokenData): void {
-    const existing = this.accounts.get(token.email);
+    const key = accountKey(token.provider, token.email);
+    const existing = this.accounts.get(key);
     if (existing) {
       existing.token = token;
       existing.cooldownUntil = 0;
@@ -129,46 +164,74 @@ export class AccountManager {
       const state = this.createAccountState(token);
       state.lastSuccessAt = new Date().toISOString();
       state.lastRefreshAt = new Date().toISOString();
-      this.accounts.set(token.email, state);
-      this.accountOrder.push(token.email);
+      this.accounts.set(key, state);
+      const pool = this.getOrCreatePool(token.provider);
+      pool.accountOrder.push(key);
     }
 
     saveToken(this.authDir, token);
   }
 
-  enableAccount(email: string): boolean {
-    const acct = this.accounts.get(email);
-    if (!acct) return false;
-    acct.disabled = false;
-    acct.cooldownUntil = 0;
-    acct.failureCount = 0;
-    acct.lastError = null;
-    acct.lastFailureAt = null;
-    console.log(`Account ${email} has been re-enabled`);
-    return true;
+  enableAccount(email: string, provider?: ProviderType): boolean {
+    // If provider is specified, enable only that provider's account
+    if (provider) {
+      const key = accountKey(provider, email);
+      const acct = this.accounts.get(key);
+      if (!acct) return false;
+      acct.disabled = false;
+      acct.cooldownUntil = 0;
+      acct.failureCount = 0;
+      acct.lastError = null;
+      acct.lastFailureAt = null;
+      console.log(`Account ${email} (${provider}) has been re-enabled`);
+      return true;
+    }
+    // Otherwise try all providers for this email and enable all matches
+    let found = false;
+    for (const p of this.providerPools.keys()) {
+      const key = accountKey(p, email);
+      const acct = this.accounts.get(key);
+      if (acct) {
+        acct.disabled = false;
+        acct.cooldownUntil = 0;
+        acct.failureCount = 0;
+        acct.lastError = null;
+        acct.lastFailureAt = null;
+        console.log(`Account ${email} (${p}) has been re-enabled`);
+        found = true;
+      }
+    }
+    return found;
   }
 
   /**
-   * Sticky account selection. Keeps using the same account for STICKY_DURATION_MS
-   * before rotating to the next one. Rotates early only when the current account
-   * enters cooldown (e.g. rate-limited).
+   * Sticky account selection per provider. Keeps using the same account for
+   * STICKY_DURATION_MS before rotating to the next one. Rotates early only
+   * when the current account enters cooldown.
+   *
+   * @param provider - Which provider's account pool to select from.
+   *                   If not specified, falls back to "claude" for backward compatibility.
    */
-  getNextAccount(): AccountResult {
-    const count = this.accountOrder.length;
+  getNextAccount(provider: ProviderType = "claude"): AccountResult {
+    const pool = this.providerPools.get(provider);
+    if (!pool) return { account: null, total: 0 };
+
+    const count = pool.accountOrder.length;
     if (count === 0) return { account: null, total: 0 };
 
     const now = Date.now();
 
     // Try to keep using the current sticky account
-    if (this.lastUsedIndex >= 0 && now < this.stickyUntil) {
-      const email = this.accountOrder[this.lastUsedIndex];
-      const acct = this.accounts.get(email)!;
+    if (pool.lastUsedIndex >= 0 && now < pool.stickyUntil) {
+      const key = pool.accountOrder[pool.lastUsedIndex];
+      const acct = this.accounts.get(key)!;
       if (acct.cooldownUntil <= now && !acct.disabled) {
         return {
           account: {
             token: acct.token,
-            deviceId: getDeviceId(this.authDir, email),
+            deviceId: getDeviceId(this.authDir, acct.token.email),
             accountUuid: acct.token.accountUuid,
+            projectId: acct.token.projectId || "",
           },
           total: count,
         };
@@ -176,19 +239,20 @@ export class AccountManager {
     }
 
     // Pick the next available account
-    const startIdx = this.lastUsedIndex >= 0 ? this.lastUsedIndex + 1 : 0;
+    const startIdx = pool.lastUsedIndex >= 0 ? pool.lastUsedIndex + 1 : 0;
     for (let i = 0; i < count; i++) {
       const idx = (startIdx + i) % count;
-      const email = this.accountOrder[idx];
-      const acct = this.accounts.get(email)!;
+      const key = pool.accountOrder[idx];
+      const acct = this.accounts.get(key)!;
       if (acct.cooldownUntil <= now && !acct.disabled) {
-        this.lastUsedIndex = idx;
-        this.stickyUntil = now + randomStickyDuration();
+        pool.lastUsedIndex = idx;
+        pool.stickyUntil = now + randomStickyDuration();
         return {
           account: {
             token: acct.token,
-            deviceId: getDeviceId(this.authDir, email),
+            deviceId: getDeviceId(this.authDir, acct.token.email),
             accountUuid: acct.token.accountUuid,
+            projectId: acct.token.projectId || "",
           },
           total: count,
         };
@@ -197,15 +261,15 @@ export class AccountManager {
     return { account: null, total: count };
   }
 
-  recordAttempt(email: string): void {
-    const acct = this.accounts.get(email);
+  recordAttempt(email: string, provider: ProviderType = "claude"): void {
+    const acct = this.accounts.get(accountKey(provider, email));
     if (acct) {
       acct.totalRequests++;
     }
   }
 
-  recordSuccess(email: string): void {
-    const acct = this.accounts.get(email);
+  recordSuccess(email: string, provider: ProviderType = "claude"): void {
+    const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
 
     acct.cooldownUntil = 0;
@@ -217,8 +281,8 @@ export class AccountManager {
     acct.totalSuccesses++;
   }
 
-  recordUsage(email: string, usage: UsageData): void {
-    const acct = this.accounts.get(email);
+  recordUsage(email: string, usage: UsageData, provider: ProviderType = "claude"): void {
+    const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
     acct.totalInputTokens += usage.inputTokens;
     acct.totalOutputTokens += usage.outputTokens;
@@ -230,8 +294,9 @@ export class AccountManager {
     email: string,
     kind: AccountFailureKind,
     detail?: string,
+    provider: ProviderType = "claude",
   ): void {
-    const acct = this.accounts.get(email);
+    const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
 
     acct.failureCount++;
@@ -249,22 +314,23 @@ export class AccountManager {
     );
     acct.cooldownUntil = Date.now() + cooldownMs;
     console.log(
-      `Account ${email} cooled down for ${Math.round(cooldownMs / 1000)}s (${kind})`,
+      `Account ${email} (${provider}) cooled down for ${Math.round(cooldownMs / 1000)}s (${kind})`,
     );
 
     // Auto-disable after too many consecutive failures
     if (acct.failureCount >= DISABLE_THRESHOLD) {
       acct.disabled = true;
       console.warn(
-        `[WARNING] Account ${email} has been DISABLED after ${acct.failureCount} ` +
+        `[WARNING] Account ${email} (${provider}) has been DISABLED after ${acct.failureCount} ` +
           `consecutive failures. Last error: ${acct.lastError}. ` +
           `Use POST /admin/accounts/${encodeURIComponent(email)}/enable to re-enable.`,
       );
     }
   }
 
-  async refreshAccount(email: string): Promise<boolean> {
-    const acct = this.accounts.get(email);
+  async refreshAccount(email: string, provider: ProviderType = "claude"): Promise<boolean> {
+    const key = accountKey(provider, email);
+    const acct = this.accounts.get(key);
     if (!acct) return false;
     if (acct.refreshPromise) {
       return acct.refreshPromise;
@@ -280,6 +346,7 @@ export class AccountManager {
     for (const acct of this.accounts.values()) {
       snapshots.push({
         email: acct.token.email,
+        provider: acct.token.provider,
         available: acct.cooldownUntil <= now && !acct.disabled,
         disabled: acct.disabled,
         cooldownUntil: acct.cooldownUntil,
@@ -344,7 +411,7 @@ export class AccountManager {
     for (const acct of this.accounts.values()) {
       const available = acct.cooldownUntil <= now && !acct.disabled;
       console.log(
-        `  ${acct.token.email}: ` +
+        `  [${acct.token.provider}] ${acct.token.email}: ` +
           `available=${available}, ` +
           `disabled=${acct.disabled}, ` +
           `requests=${acct.totalRequests}, ` +
@@ -364,15 +431,36 @@ export class AccountManager {
     return this.accounts.size;
   }
 
+  /**
+   * Get number of accounts for a specific provider.
+   */
+  getProviderAccountCount(provider: ProviderType): number {
+    return this.providerPools.get(provider)?.accountOrder.length ?? 0;
+  }
+
+  /**
+   * Get list of providers that have at least one account loaded.
+   */
+  getActiveProviders(): ProviderType[] {
+    const providers: ProviderType[] = [];
+    for (const [provider, pool] of this.providerPools) {
+      if (pool.accountOrder.length > 0) {
+        providers.push(provider);
+      }
+    }
+    return providers;
+  }
+
   private async refreshAll(): Promise<void> {
     if (this.refreshing) return;
     this.refreshing = true;
     try {
       const now = Date.now();
       for (const acct of this.accounts.values()) {
+        const provider = getAuthProvider(acct.token.provider);
         const expiresAt = new Date(acct.token.expiresAt).getTime();
-        if (expiresAt - now <= REFRESH_LEAD_MS) {
-          await this.refreshAccount(acct.token.email);
+        if (expiresAt - now <= provider.refreshLeadMs) {
+          await this.refreshAccount(acct.token.email, acct.token.provider);
         }
       }
     } finally {
@@ -385,9 +473,11 @@ export class AccountManager {
 
     acct.refreshing = true;
     try {
-      console.log(`Refreshing token for ${acct.token.email}...`);
-      const newToken = await refreshTokensWithRetry(acct.token.refreshToken);
+      const provider = getAuthProvider(acct.token.provider);
+      console.log(`Refreshing token for ${acct.token.email} (${acct.token.provider})...`);
+      const newToken = await refreshTokensWithRetry(provider, acct.token.refreshToken);
       newToken.email = newToken.email || acct.token.email;
+      newToken.provider = acct.token.provider;
       acct.token = newToken;
       acct.cooldownUntil = 0;
       acct.failureCount = 0;
@@ -396,12 +486,12 @@ export class AccountManager {
       acct.lastSuccessAt = new Date().toISOString();
       acct.lastRefreshAt = new Date().toISOString();
       saveToken(this.authDir, newToken);
-      console.log(`Token refreshed, expires ${newToken.expiresAt}`);
+      console.log(`Token refreshed for ${acct.token.email} (${acct.token.provider}), expires ${newToken.expiresAt}`);
       return true;
     } catch (err: any) {
-      this.recordFailure(acct.token.email, "auth", err.message);
+      this.recordFailure(acct.token.email, "auth", err.message, acct.token.provider);
       console.error(
-        `Token refresh failed for ${acct.token.email}: ${err.message}`,
+        `Token refresh failed for ${acct.token.email} (${acct.token.provider}): ${err.message}`,
       );
       return false;
     } finally {

@@ -1,7 +1,8 @@
 host: ""
 port: 8317
 
-# Directory to store OAuth tokens
+# Directory to store OAuth tokens (all providers share this directory)
+# Token files are named: {provider}-{email}.json (e.g. claude-user@example.com.json)
 auth-dir: "~/.auth2api"
 
 # API keys for client authentication (clients use these to access this proxy)
@@ -32,6 +33,7 @@ debug: "off"
 
 # Request fingerprinting — controls how auth2api mimics Claude Code CLI
 # These settings affect the User-Agent, billing header, and fingerprint
+# (Only applies to Claude provider)
 cloaking:
   # CLI version to impersonate (default: 2.1.88)
   # This affects User-Agent and the fingerprint in billing-header
@@ -40,3 +42,25 @@ cloaking:
   # Entrypoint for billing attribution (default: cli)
   # Claude Code uses: cli, mcp, sdk, etc.
   entrypoint: "cli"
+
+# ── Multi-provider support ──
+#
+# Login commands:
+#   node dist/index.js --login            # Claude (or --claude-login)
+#   node dist/index.js --codex-login      # Codex (OpenAI)
+#   node dist/index.js --gemini-login     # Gemini (Google)
+#
+# Add --manual for remote server login (paste callback URL manually).
+#
+# Model routing is automatic based on model name prefix:
+#   claude-*, opus, sonnet, haiku  →  Claude provider
+#   gpt-*, o1*, o3*, o4*           →  Codex provider
+#   gemini-*                       →  Gemini provider
+#
+# Custom model aliases (optional):
+# model-alias:
+#   # Simple: alias → target model (provider auto-detected)
+#   "smart": "claude-sonnet-4-6"
+#   "fast": "gemini-2.5-flash"
+#   # Explicit: alias → { provider, model }
+#   "my-gpt": { provider: "codex", model: "gpt-4o" }

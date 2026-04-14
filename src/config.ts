@@ -22,6 +22,11 @@ export interface TimeoutConfig {
 
 export type DebugMode = "off" | "errors" | "verbose";
 
+export interface ModelAliasEntry {
+  provider: string;
+  model: string;
+}
+
 export interface Config {
   host: string;
   port: number;
@@ -32,6 +37,7 @@ export interface Config {
   cloaking: CloakingConfig;
   timeouts: TimeoutConfig;
   debug: DebugMode;
+  "model-alias"?: Record<string, string | ModelAliasEntry>;
 }
 
 const DEFAULT_CONFIG: Config = {

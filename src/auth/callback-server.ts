@@ -12,15 +12,26 @@ const SUCCESS_HTML = `<!DOCTYPE html>
 <p>You can close this tab and return to the terminal.</p>
 </body></html>`;
 
+/** Valid callback paths for different providers */
+const CALLBACK_PATHS = new Set(["/callback", "/auth/callback", "/oauth2callback"]);
+
+/**
+ * Start a local HTTP server to receive the OAuth callback.
+ * Supports multiple callback paths for different providers:
+ * - /callback (Claude, default)
+ * - /auth/callback (Codex)
+ * - /oauth2callback (Gemini)
+ */
 export function waitForCallback(
   port = 54545,
   timeoutMs = 300000,
 ): Promise<CallbackResult> {
+
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       const url = new URL(req.url || "/", `http://localhost:${port}`);
 
-      if (url.pathname === "/callback") {
+      if (CALLBACK_PATHS.has(url.pathname)) {
         const error = url.searchParams.get("error");
         if (error) {
           res.writeHead(400, { "Content-Type": "text/plain" });

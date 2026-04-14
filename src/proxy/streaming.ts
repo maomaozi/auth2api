@@ -75,8 +75,8 @@ export async function handleStreamingResponse(
           }
         }
       }
-      completed = true;
     }
+    completed = !clientDisconnected;
   } catch (err) {
     if (!clientDisconnected) console.error("Stream error:", err);
   } finally {

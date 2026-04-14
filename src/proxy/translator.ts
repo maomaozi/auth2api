@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
+import { EFFORT_TO_BUDGET } from "./shared";
 
 // ── Model alias resolution ──
 
@@ -16,14 +17,6 @@ export function resolveModel(model: string): string {
 }
 
 // ── Reasoning effort → Claude thinking config ──
-
-const EFFORT_TO_BUDGET: Record<string, number> = {
-  none: 0,
-  low: 1024,
-  medium: 8192,
-  high: 24576,
-  xhigh: 32768,
-};
 
 function applyThinking(claudeBody: any, reasoningEffort: string): void {
   if (reasoningEffort === "none") {

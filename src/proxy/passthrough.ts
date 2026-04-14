@@ -2,25 +2,18 @@ import crypto from "crypto";
 import { Request, Response as ExpressResponse } from "express";
 import { extractApiKey } from "../api-key";
 import { Config, isDebugLevel } from "../config";
-import {
-  AccountFailureKind,
-  AccountManager,
-  UsageData,
-} from "../accounts/manager";
+import { AccountManager, UsageData } from "../accounts/manager";
 import { applyCloaking } from "./cloaking";
 import { callClaudeAPI, callClaudeCountTokens } from "./claude-api";
+import {
+  MAX_RETRIES,
+  RETRYABLE_STATUSES,
+  classifyFailure,
+  extractUsage,
+  sendUpstreamError,
+} from "./shared";
 
-const MAX_RETRIES = 3;
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
-
-function classifyFailure(status: number): AccountFailureKind {
-  if (status === 429) return "rate_limit";
-  if (status === 401) return "auth";
-  if (status === 403) return "forbidden";
-  return "server";
-}
-
-// POST /v1/messages — Claude native format passthrough
+// POST /v1/messages — Claude native format passthrough (always uses Claude provider)
 export function createMessagesHandler(config: Config, manager: AccountManager) {
   return async (req: Request, res: ExpressResponse): Promise<void> => {
     try {
@@ -73,18 +66,18 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
       let lastErrBody = "";
       const refreshedAccounts = new Set<string>();
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const { account, total } = manager.getNextAccount();
+        const { account, total } = manager.getNextAccount("claude");
         if (!account) {
           const status = total === 0 ? 503 : 429;
           const message =
             total === 0
-              ? "No available account"
-              : "Rate limited on the configured account";
+              ? "No available claude account"
+              : "Rate limited on the configured claude account";
           res.status(status).json({ error: { message } });
           return;
         }
 
-        manager.recordAttempt(account.token.email);
+        manager.recordAttempt(account.token.email, "claude");
 
         // Apply per-account cloaking (clone body so each attempt is fresh)
         const claudeBody = applyCloaking(
@@ -114,7 +107,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
             passthroughHeaders,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message);
+          manager.recordFailure(account.token.email, "network", err.message, "claude");
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
               `Messages attempt ${attempt + 1} network failure: ${err.message}`,
@@ -195,8 +188,8 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
                 }
               }
               if (!clientDisconnected) {
-                manager.recordSuccess(account.token.email);
-                manager.recordUsage(account.token.email, usage);
+                manager.recordSuccess(account.token.email, "claude");
+                manager.recordUsage(account.token.email, usage, "claude");
               }
             } catch (err) {
               if (!clientDisconnected) {
@@ -204,6 +197,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
                   account.token.email,
                   "network",
                   "stream terminated before completion",
+                  "claude",
                 );
               }
               if (!clientDisconnected) console.error("Stream pipe error:", err);
@@ -213,14 +207,8 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
           } else {
             // Forward JSON response directly
             const data = await upstreamResp.json();
-            manager.recordSuccess(account.token.email);
-            manager.recordUsage(account.token.email, {
-              inputTokens: data.usage?.input_tokens || 0,
-              outputTokens: data.usage?.output_tokens || 0,
-              cacheCreationInputTokens:
-                data.usage?.cache_creation_input_tokens || 0,
-              cacheReadInputTokens: data.usage?.cache_read_input_tokens || 0,
-            });
+            manager.recordSuccess(account.token.email, "claude");
+            manager.recordUsage(account.token.email, extractUsage(data), "claude");
             res.json(data);
           }
           return;
@@ -239,7 +227,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
         }
 
         if (lastStatus === 401) {
-          const refreshed = await manager.refreshAccount(account.token.email);
+          const refreshed = await manager.refreshAccount(account.token.email, "claude");
           if (refreshed && !refreshedAccounts.has(account.token.email)) {
             refreshedAccounts.add(account.token.email);
             attempt--;
@@ -249,6 +237,8 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
           manager.recordFailure(
             account.token.email,
             classifyFailure(lastStatus),
+            undefined,
+            "claude",
           );
         }
         if (!RETRYABLE_STATUSES.has(lastStatus)) break;
@@ -257,20 +247,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
         }
       }
 
-      try {
-        const parsed = lastErrBody ? JSON.parse(lastErrBody) : null;
-        if (parsed && typeof parsed === "object") {
-          res.status(lastStatus).json(parsed);
-        } else {
-          res
-            .status(lastStatus)
-            .json({ error: { message: "Upstream request failed" } });
-        }
-      } catch {
-        res
-          .status(lastStatus)
-          .json({ error: { message: "Upstream request failed" } });
-      }
+      sendUpstreamError(res, lastStatus, lastErrBody);
     } catch (err: any) {
       console.error("Messages handler error:", err.message);
       res.status(500).json({
@@ -280,7 +257,7 @@ export function createMessagesHandler(config: Config, manager: AccountManager) {
   };
 }
 
-// POST /v1/messages/count_tokens — passthrough
+// POST /v1/messages/count_tokens — passthrough (Claude only)
 export function createCountTokensHandler(
   config: Config,
   manager: AccountManager,
@@ -297,18 +274,18 @@ export function createCountTokensHandler(
       let lastErrBody = "";
       const refreshedAccounts = new Set<string>();
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const { account, total } = manager.getNextAccount();
+        const { account, total } = manager.getNextAccount("claude");
         if (!account) {
           const status = total === 0 ? 503 : 429;
           const message =
             total === 0
-              ? "No available account"
-              : "Rate limited on the configured account";
+              ? "No available claude account"
+              : "Rate limited on the configured claude account";
           res.status(status).json({ error: { message } });
           return;
         }
 
-        manager.recordAttempt(account.token.email);
+        manager.recordAttempt(account.token.email, "claude");
 
         let upstreamResp: globalThis.Response;
         try {
@@ -320,7 +297,7 @@ export function createCountTokensHandler(
             apiKeyHash,
           );
         } catch (err: any) {
-          manager.recordFailure(account.token.email, "network", err.message);
+          manager.recordFailure(account.token.email, "network", err.message, "claude");
           if (isDebugLevel(config.debug, "errors")) {
             console.error(
               `Count tokens attempt ${attempt + 1} network failure: ${err.message}`,
@@ -337,7 +314,7 @@ export function createCountTokensHandler(
         }
 
         if (upstreamResp.ok) {
-          manager.recordSuccess(account.token.email);
+          manager.recordSuccess(account.token.email, "claude");
           const data = await upstreamResp.json();
           res.json(data);
           return;
@@ -346,7 +323,7 @@ export function createCountTokensHandler(
         lastStatus = upstreamResp.status;
         lastErrBody = await upstreamResp.text().catch(() => "");
         if (lastStatus === 401) {
-          const refreshed = await manager.refreshAccount(account.token.email);
+          const refreshed = await manager.refreshAccount(account.token.email, "claude");
           if (refreshed && !refreshedAccounts.has(account.token.email)) {
             refreshedAccounts.add(account.token.email);
             attempt--;
@@ -356,6 +333,8 @@ export function createCountTokensHandler(
           manager.recordFailure(
             account.token.email,
             classifyFailure(lastStatus),
+            undefined,
+            "claude",
           );
         }
 
@@ -365,20 +344,7 @@ export function createCountTokensHandler(
         }
       }
 
-      try {
-        const parsed = lastErrBody ? JSON.parse(lastErrBody) : null;
-        if (parsed && typeof parsed === "object") {
-          res.status(lastStatus).json(parsed);
-        } else {
-          res
-            .status(lastStatus)
-            .json({ error: { message: "Upstream request failed" } });
-        }
-      } catch {
-        res
-          .status(lastStatus)
-          .json({ error: { message: "Upstream request failed" } });
-      }
+      sendUpstreamError(res, lastStatus, lastErrBody);
     } catch (err: any) {
       console.error("Count tokens error:", err.message);
       res.status(500).json({
