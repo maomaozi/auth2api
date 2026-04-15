@@ -1,8 +1,17 @@
 import { v4 as uuidv4 } from "uuid";
 
+// ── Tool name mapping: shortened → original ──
+
+export type ToolNameMap = Map<string, string>;
+
+export interface CodexRequestResult {
+  body: any;
+  toolNameMap: ToolNameMap;
+}
+
 // ── OpenAI Chat Completions request → Codex Responses API request ──
 
-export function chatCompletionsToCodexRequest(body: any): any {
+export function chatCompletionsToCodexRequest(body: any): CodexRequestResult {
   const codexBody: any = {
     model: body.model,
     stream: !!body.stream,
@@ -12,10 +21,15 @@ export function chatCompletionsToCodexRequest(body: any): any {
   if (body.temperature !== undefined) codexBody.temperature = body.temperature;
   if (body.top_p !== undefined) codexBody.top_p = body.top_p;
 
-  // reasoning_effort → reasoning
+  // reasoning_effort → reasoning (with summary)
   if (body.reasoning_effort) {
-    codexBody.reasoning = { effort: body.reasoning_effort };
+    codexBody.reasoning = { effort: body.reasoning_effort, summary: "auto" };
+  } else {
+    codexBody.reasoning = { effort: "medium", summary: "auto" };
   }
+
+  codexBody.include = ["reasoning.encrypted_content"];
+  codexBody.parallel_tool_calls = true;
 
   // Build input[] from messages[]
   const input: any[] = [];
@@ -76,16 +90,20 @@ export function chatCompletionsToCodexRequest(body: any): any {
     });
   }
 
-  if (instructions) codexBody.instructions = instructions;
+  // Always include instructions (even if empty) for Codex normalization
+  codexBody.instructions = instructions;
   codexBody.input = input;
 
-  // Tools
+  // Tools (with name truncation to ≤64 chars + mapping for restoration)
+  const toolNameMap: ToolNameMap = new Map();
   if (body.tools) {
     codexBody.tools = body.tools.map((t: any) => {
       if (t.type === "function" && t.function) {
+        const originalName = t.function.name || "";
+        const shortened = shortenToolName(originalName, toolNameMap);
         return {
           type: "function",
-          name: t.function.name,
+          name: shortened,
           description: t.function.description || "",
           parameters: t.function.parameters || { type: "object", properties: {} },
         };
@@ -98,12 +116,12 @@ export function chatCompletionsToCodexRequest(body: any): any {
     codexBody.tool_choice = body.tool_choice;
   }
 
-  return codexBody;
+  return { body: codexBody, toolNameMap };
 }
 
 // ── Codex Responses API response → OpenAI Chat Completions response ──
 
-export function codexResponseToOpenAI(respData: any, model: string): any {
+export function codexResponseToOpenAI(respData: any, model: string, toolNameMap?: ToolNameMap): any {
   const output = respData.output || [];
   let textContent = "";
   const toolCalls: any[] = [];
@@ -121,11 +139,12 @@ export function codexResponseToOpenAI(respData: any, model: string): any {
         textContent += item.content;
       }
     } else if (item.type === "function_call") {
+      const rawName = item.name || "";
       toolCalls.push({
         id: item.call_id || item.id,
         type: "function",
         function: {
-          name: item.name,
+          name: toolNameMap?.get(rawName) || rawName,
           arguments: item.arguments || "{}",
         },
       });
@@ -174,9 +193,10 @@ export interface CodexStreamState {
   outputTokens: number;
   started: boolean;
   hasToolCalls: boolean;
+  toolNameMap: ToolNameMap;
 }
 
-export function createCodexStreamState(model: string): CodexStreamState {
+export function createCodexStreamState(model: string, toolNameMap?: ToolNameMap): CodexStreamState {
   return {
     chatId: `chatcmpl-${uuidv4()}`,
     model,
@@ -184,6 +204,7 @@ export function createCodexStreamState(model: string): CodexStreamState {
     outputTokens: 0,
     started: false,
     hasToolCalls: false,
+    toolNameMap: toolNameMap || new Map(),
   };
 }
 
@@ -227,10 +248,16 @@ export function codexSSEToOpenAI(
     return chunks;
   }
 
+  if (type === "response.reasoning_summary_text.delta") {
+    chunks.push(makeOpenAIChunk(state, { reasoning_content: eventData.delta || "" }, null));
+    return chunks;
+  }
+
   if (type === "response.output_item.added") {
     const item = eventData.item;
     if (item?.type === "function_call") {
       state.hasToolCalls = true;
+      const rawName = item.name || "";
       chunks.push(
         makeOpenAIChunk(
           state,
@@ -240,7 +267,7 @@ export function codexSSEToOpenAI(
                 index: eventData.output_index || 0,
                 id: item.call_id || item.id,
                 type: "function",
-                function: { name: item.name || "", arguments: "" },
+                function: { name: state.toolNameMap.get(rawName) || rawName, arguments: "" },
               },
             ],
           },
@@ -294,4 +321,35 @@ export function codexSSEToOpenAI(
   }
 
   return chunks;
+}
+
+// ── Tool name truncation ──
+
+const MAX_TOOL_NAME_LENGTH = 64;
+
+/**
+ * Shorten tool name to ≤64 characters.
+ * Preserves `mcp__` prefix if present, then takes the last segment.
+ * Records the mapping (shortened → original) in nameMap for later restoration.
+ */
+function shortenToolName(name: string, nameMap: ToolNameMap): string {
+  if (name.length <= MAX_TOOL_NAME_LENGTH) return name;
+
+  let shortened: string;
+
+  // If it has mcp__ prefix, try to preserve prefix + last segment
+  if (name.startsWith("mcp__")) {
+    const withoutPrefix = name.slice(5); // remove "mcp__"
+    const segments = withoutPrefix.split("_");
+    const lastSegment = segments[segments.length - 1];
+    shortened = `mcp__${lastSegment}`;
+    if (shortened.length > MAX_TOOL_NAME_LENGTH) {
+      shortened = shortened.slice(0, MAX_TOOL_NAME_LENGTH);
+    }
+  } else {
+    shortened = name.slice(0, MAX_TOOL_NAME_LENGTH);
+  }
+
+  nameMap.set(shortened, name);
+  return shortened;
 }

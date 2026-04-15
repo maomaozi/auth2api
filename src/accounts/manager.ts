@@ -409,6 +409,7 @@ export class AccountManager {
     detail?: string,
     provider: ProviderType = "claude",
     tracking?: TrackingContext,
+    cooldownOverrideMs?: number,
   ): void {
     const acct = this.accounts.get(accountKey(provider, email));
     if (!acct) return;
@@ -426,11 +427,16 @@ export class AccountManager {
     // Already disabled: skip cooldown math and log spam.
     if (acct.disabled) return;
 
-    const { baseMs, maxMs } = FAILURE_BACKOFF[kind];
-    const cooldownMs = Math.min(
-      baseMs * 2 ** Math.max(0, acct.failureCount - 1),
-      maxMs,
-    );
+    let cooldownMs: number;
+    if (cooldownOverrideMs !== undefined) {
+      cooldownMs = cooldownOverrideMs;
+    } else {
+      const { baseMs, maxMs } = FAILURE_BACKOFF[kind];
+      cooldownMs = Math.min(
+        baseMs * 2 ** Math.max(0, acct.failureCount - 1),
+        maxMs,
+      );
+    }
     acct.cooldownUntil = Date.now() + cooldownMs;
     console.log(
       `Account ${email} (${provider}) cooled down for ${Math.round(cooldownMs / 1000)}s (${kind})`,
@@ -641,6 +647,9 @@ export class AccountManager {
       const newToken = await refreshTokensWithRetry(provider, acct.token.refreshToken);
       newToken.email = newToken.email || acct.token.email;
       newToken.provider = acct.token.provider;
+      // Preserve fields that the refresh response may not include
+      newToken.accountUuid = newToken.accountUuid || acct.token.accountUuid;
+      newToken.projectId = newToken.projectId || acct.token.projectId;
       acct.token = newToken;
       acct.cooldownUntil = 0;
       acct.failureCount = 0;

@@ -24,6 +24,40 @@ export function classifyFailure(status: number): AccountFailureKind {
   return "server";
 }
 
+/**
+ * Detect Codex "model at capacity" errors that should be treated as 429.
+ */
+export function isCodexModelCapacityError(body: string): boolean {
+  if (!body) return false;
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("selected model is at capacity") ||
+    lower.includes("model is at capacity. please try a different model")
+  );
+}
+
+/**
+ * Parse retry-after duration from a Codex 429 error response.
+ * Returns cooldown in milliseconds, or undefined if not parseable.
+ */
+export function parseCodexRetryAfter(body: string): number | undefined {
+  if (!body) return undefined;
+  try {
+    const parsed = JSON.parse(body);
+    const error = parsed?.error;
+    if (!error || error.type !== "usage_limit_reached") return undefined;
+    const now = Date.now();
+    if (error.resets_at) {
+      const resetMs = Number(error.resets_at) * 1000;
+      if (resetMs > now) return resetMs - now;
+    }
+    if (error.resets_in_seconds) {
+      return Number(error.resets_in_seconds) * 1000;
+    }
+  } catch { /* ignore parse errors */ }
+  return undefined;
+}
+
 export function extractUsage(resp: any): UsageData {
   return {
     inputTokens: resp.usage?.input_tokens || resp.usage?.prompt_tokens || 0,

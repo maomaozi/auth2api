@@ -46,8 +46,8 @@ export async function refreshTokensWithRetry(
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await provider.refreshTokens(refreshToken);
-    } catch (err) {
-      if (attempt === maxRetries) throw err;
+    } catch (err: any) {
+      if (err.nonRetryable || attempt === maxRetries) throw err;
       await new Promise((r) => setTimeout(r, attempt * 1000));
     }
   }

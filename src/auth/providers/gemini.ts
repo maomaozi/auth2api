@@ -14,9 +14,17 @@ const SCOPES = [
 ];
 const USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
 
-const LOAD_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+const LOAD_CODE_ASSIST_URL = `${GEMINI_CLI_ENDPOINT}/v1internal:loadCodeAssist`;
+const ONBOARD_USER_URL = `${GEMINI_CLI_ENDPOINT}/v1internal:onboardUser`;
 
 const REFRESH_LEAD_MS = 30 * 60 * 1000; // 30 minutes before expiry (Google tokens are short-lived, ~1h)
+
+const ONBOARD_METADATA = {
+  ideType: "IDE_UNSPECIFIED",
+  platform: "PLATFORM_UNSPECIFIED",
+  pluginType: "GEMINI",
+};
 
 export class GeminiAuthProvider implements AuthProvider {
   readonly type = "gemini" as const;
@@ -125,40 +133,115 @@ export class GeminiAuthProvider implements AuthProvider {
   }
 
   /**
-   * Fetch the GCP project ID from the Gemini CLI loadCodeAssist endpoint.
-   * This is required for the Gemini CLI API envelope.
+   * Fetch the GCP project ID via loadCodeAssist + onboardUser flow.
+   * 1. loadCodeAssist → get tiers and auto-discovered project
+   * 2. onboardUser → activate project (with polling for long-running operations)
    */
   private async fetchProjectId(accessToken: string): Promise<string> {
     try {
-      const resp = await fetch(LOAD_CODE_ASSIST_URL, {
+      // Step 1: loadCodeAssist
+      const loadResp = await fetch(LOAD_CODE_ASSIST_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          metadata: {
-            ideType: "ANTIGRAVITY",
-            platform: "PLATFORM_UNSPECIFIED",
-            pluginType: "GEMINI",
-          },
-        }),
+        body: JSON.stringify({ metadata: ONBOARD_METADATA }),
       });
-      if (!resp.ok) return "";
-      const data: any = await resp.json();
+      if (!loadResp.ok) return "";
+      const loadData: any = await loadResp.json();
 
-      // Try cloudaicompanionProject as string
-      if (typeof data.cloudaicompanionProject === "string") {
-        return data.cloudaicompanionProject.trim();
+      // Extract project from loadCodeAssist response
+      let projectId = this.extractProjectId(loadData);
+
+      // Extract default tier ID for onboarding
+      const tierId = this.extractDefaultTierId(loadData);
+
+      // Step 2: onboardUser to activate the project
+      if (tierId) {
+        const onboardedProject = await this.onboardUser(accessToken, tierId, projectId);
+        if (onboardedProject) {
+          projectId = onboardedProject;
+        }
       }
-      // Try cloudaicompanionProject.id as object
-      if (typeof data.cloudaicompanionProject?.id === "string") {
-        return data.cloudaicompanionProject.id.trim();
-      }
+
+      return projectId;
     } catch {
       // Project ID fetch failure is non-fatal at login time
     }
     return "";
+  }
+
+  /**
+   * Call onboardUser endpoint and poll until done.
+   */
+  private async onboardUser(
+    accessToken: string,
+    tierId: string,
+    existingProjectId?: string,
+  ): Promise<string> {
+    try {
+      const body: any = {
+        tierId,
+        metadata: ONBOARD_METADATA,
+      };
+      if (existingProjectId) {
+        body.cloudaicompanionProject = existingProjectId;
+      }
+
+      const resp = await fetch(ONBOARD_USER_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) return "";
+
+      let data: any = await resp.json();
+
+      // Poll if the operation is not yet done (up to 30s)
+      const deadline = Date.now() + 30_000;
+      while (!data.done && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        // Re-call to check status
+        const pollResp = await fetch(ONBOARD_USER_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+        if (!pollResp.ok) break;
+        data = await pollResp.json();
+      }
+
+      // Extract project from the response
+      const response = data.response || data;
+      return this.extractProjectId(response);
+    } catch {
+      return "";
+    }
+  }
+
+  private extractProjectId(data: any): string {
+    if (typeof data.cloudaicompanionProject === "string") {
+      return data.cloudaicompanionProject.trim();
+    }
+    if (typeof data.cloudaicompanionProject?.id === "string") {
+      return data.cloudaicompanionProject.id.trim();
+    }
+    return "";
+  }
+
+  private extractDefaultTierId(data: any): string {
+    const tiers = data.allowedTiers;
+    if (!Array.isArray(tiers) || tiers.length === 0) return "";
+    // Find the default tier
+    const defaultTier = tiers.find((t: any) => t.isDefault === true);
+    return defaultTier?.tierId || tiers[0]?.tierId || "";
   }
 
   private async fetchUserEmail(accessToken: string): Promise<string> {

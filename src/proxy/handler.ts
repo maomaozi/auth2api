@@ -12,6 +12,7 @@ import {
   codexResponseToOpenAI,
   codexSSEToOpenAI,
   createCodexStreamState,
+  ToolNameMap,
 } from "./codex-translator";
 import {
   openaiToGeminiCLI,
@@ -26,7 +27,14 @@ import {
   extractUsage,
   sendUpstreamError,
   callUpstream,
+  isCodexModelCapacityError,
+  parseCodexRetryAfter,
 } from "./shared";
+
+interface PreparedRequest {
+  body: any;
+  toolNameMap: ToolNameMap;
+}
 
 /**
  * Prepare the request body for the target provider.
@@ -36,17 +44,19 @@ function prepareBody(
   body: any,
   model: string,
   projectId: string,
-): any {
+): PreparedRequest {
   // Apply resolved model name (aliases, Claude short names) to the body
   // so translators send the correct model to upstream APIs
   const bodyWithModel = { ...body, model };
   switch (provider) {
     case "claude":
-      return openaiToClaude(bodyWithModel);
-    case "codex":
-      return chatCompletionsToCodexRequest(bodyWithModel);
+      return { body: openaiToClaude(bodyWithModel), toolNameMap: new Map() };
+    case "codex": {
+      const result = chatCompletionsToCodexRequest(bodyWithModel);
+      return { body: result.body, toolNameMap: result.toolNameMap };
+    }
     case "gemini":
-      return openaiToGeminiCLI(bodyWithModel, projectId);
+      return { body: openaiToGeminiCLI(bodyWithModel, projectId), toolNameMap: new Map() };
   }
 }
 
@@ -85,7 +95,7 @@ export function createChatCompletionsHandler(
 
       // Pre-compute body for providers that don't need per-account data
       // Gemini needs per-account projectId, so it's prepared inside the loop
-      const precomputedBody =
+      const precomputed: PreparedRequest | null =
         provider !== "gemini"
           ? prepareBody(provider, body, model, "")
           : null;
@@ -109,8 +119,10 @@ export function createChatCompletionsHandler(
         manager.recordAttempt(account.token.email, provider, tracking);
 
         // Gemini needs per-account projectId; others use precomputed body
-        const preparedBody =
-          precomputedBody || prepareBody(provider, body, model, account.projectId);
+        const prepared: PreparedRequest =
+          precomputed || prepareBody(provider, body, model, account.projectId);
+        const preparedBody = prepared.body;
+        const toolNameMap = prepared.toolNameMap;
 
         // For Claude, apply cloaking
         let finalBody: any;
@@ -162,13 +174,13 @@ export function createChatCompletionsHandler(
         if (upstreamResp.ok) {
           if (stream) {
             await handleProviderStream(
-              provider, upstreamResp, res, model, account, manager, tracking,
+              provider, upstreamResp, res, model, account, manager, tracking, toolNameMap,
             );
           } else {
             const respData = await upstreamResp.json();
             manager.recordSuccess(account.token.email, provider, tracking);
             manager.recordUsage(account.token.email, extractProviderUsage(provider, respData), provider, tracking);
-            res.json(translateResponse(provider, respData, model));
+            res.json(translateResponse(provider, respData, model, toolNameMap));
           }
           return;
         }
@@ -185,6 +197,11 @@ export function createChatCompletionsHandler(
           /* ignore */
         }
 
+        // Codex "model at capacity" should be treated as rate_limit (429)
+        if (provider === "codex" && isCodexModelCapacityError(lastErrBody)) {
+          lastStatus = 429;
+        }
+
         if (lastStatus === 401) {
           const refreshed = await manager.refreshAccount(account.token.email, provider);
           if (refreshed && !refreshedAccounts.has(account.token.email)) {
@@ -193,12 +210,18 @@ export function createChatCompletionsHandler(
             continue;
           }
         } else {
+          // Parse precise retry-after from Codex 429 responses
+          const retryAfterMs =
+            provider === "codex" && lastStatus === 429
+              ? parseCodexRetryAfter(lastErrBody)
+              : undefined;
           manager.recordFailure(
             account.token.email,
             classifyFailure(lastStatus),
             undefined,
             provider,
             tracking,
+            retryAfterMs,
           );
         }
 
@@ -219,12 +242,12 @@ export function createChatCompletionsHandler(
 /**
  * Translate a non-streaming response to OpenAI chat completions format.
  */
-function translateResponse(provider: ProviderType, respData: any, model: string): any {
+function translateResponse(provider: ProviderType, respData: any, model: string, toolNameMap?: ToolNameMap): any {
   switch (provider) {
     case "claude":
       return claudeToOpenai(respData, model);
     case "codex":
-      return codexResponseToOpenAI(respData, model);
+      return codexResponseToOpenAI(respData, model, toolNameMap);
     case "gemini":
       return geminiToOpenAI(respData, model);
   }
@@ -258,6 +281,7 @@ async function handleProviderStream(
   account: { token: { email: string }; accountUuid: string },
   manager: AccountManager,
   tracking?: TrackingContext,
+  toolNameMap?: ToolNameMap,
 ): Promise<void> {
   if (provider === "claude") {
     const streamResult = await handleStreamingResponse(upstreamResp, res, model);
@@ -288,7 +312,7 @@ async function handleProviderStream(
   let doneSent = false;
   const decoder = new TextDecoder();
 
-  const codexState = provider === "codex" ? createCodexStreamState(model) : null;
+  const codexState = provider === "codex" ? createCodexStreamState(model, toolNameMap) : null;
   const geminiState = provider === "gemini" ? createGeminiStreamState(model) : null;
 
   res.on("close", () => {
@@ -311,8 +335,9 @@ async function handleProviderStream(
         const raw = line.slice(5).trim();
         if (!raw || raw === "[DONE]") {
           if (raw === "[DONE]" && !doneSent) {
-            // For Gemini, send final completion chunk
-            if (geminiState) {
+            // For Gemini, send final completion chunk only if one
+            // wasn't already emitted by geminiSSEToOpenAI (via finishReason)
+            if (geminiState && !geminiState.finishSent) {
               const usage = {
                 prompt_tokens: geminiState.inputTokens,
                 completion_tokens: geminiState.outputTokens,

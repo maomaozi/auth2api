@@ -1,5 +1,15 @@
 import { v4 as uuidv4 } from "uuid";
 
+// ── Default safety settings (match CLIProxyAPI reference) ──
+
+const DEFAULT_SAFETY_SETTINGS = [
+  { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
+  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
+];
+
 // ── OpenAI Chat Completions → Gemini CLI native format ──
 
 export function openaiToGeminiCLI(body: any, projectId: string): any {
@@ -42,7 +52,7 @@ export function openaiToGeminiCLI(body: any, projectId: string): any {
         }
       }
 
-      // Tool calls → functionCall parts
+      // Tool calls → functionCall parts (with thoughtSignature)
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           let args: any = {};
@@ -54,6 +64,7 @@ export function openaiToGeminiCLI(body: any, projectId: string): any {
               name: tc.function?.name || "",
               args,
             },
+            thoughtSignature: "skip_thought_signature_validator",
           });
         }
       }
@@ -94,7 +105,14 @@ export function openaiToGeminiCLI(body: any, projectId: string): any {
     };
   }
 
-  request.contents = contents;
+  // Backfill empty functionResponse names from preceding model functionCall names
+  backfillFunctionResponseNames(contents);
+
+  // Enforce role alternation: merge consecutive same-role messages
+  request.contents = enforceRoleAlternation(contents);
+
+  // Safety settings
+  request.safetySettings = DEFAULT_SAFETY_SETTINGS;
 
   // Generation config
   const genConfig: any = {};
@@ -123,11 +141,20 @@ export function openaiToGeminiCLI(body: any, projectId: string): any {
   if (body.tools) {
     const functionDeclarations = body.tools
       .filter((t: any) => t.type === "function" && t.function)
-      .map((t: any) => ({
-        name: t.function.name,
-        description: t.function.description || "",
-        parametersJsonSchema: t.function.parameters || { type: "object", properties: {} },
-      }));
+      .map((t: any) => {
+        const params = { ...(t.function.parameters || { type: "object", properties: {} }) };
+        // Remove $schema which Gemini doesn't accept
+        delete params.$schema;
+        // Enforce strict object validation
+        if (params.type === "object") {
+          params.additionalProperties = false;
+        }
+        return {
+          name: t.function.name,
+          description: t.function.description || "",
+          parametersJsonSchema: params,
+        };
+      });
     if (functionDeclarations.length) {
       request.tools = [{ functionDeclarations }];
     }
@@ -259,6 +286,7 @@ export interface GeminiStreamState {
   inputTokens: number;
   outputTokens: number;
   started: boolean;
+  finishSent: boolean;
 }
 
 export function createGeminiStreamState(model: string): GeminiStreamState {
@@ -268,6 +296,7 @@ export function createGeminiStreamState(model: string): GeminiStreamState {
     inputTokens: 0,
     outputTokens: 0,
     started: false,
+    finishSent: false,
   };
 }
 
@@ -347,6 +376,7 @@ export function geminiSSEToOpenAI(
   // Finish reason — emit for all finish reasons including STOP
   const finishReason = candidate?.finishReason;
   if (finishReason) {
+    state.finishSent = true;
     chunks.push(
       makeChunk(state, {}, mapFinishReason(finishReason), usage ? {
         prompt_tokens: usage.promptTokenCount || 0,
@@ -357,4 +387,62 @@ export function geminiSSEToOpenAI(
   }
 
   return chunks;
+}
+
+// ── Helpers for role alternation and functionResponse name backfill ──
+
+/**
+ * Enforce Gemini's strict role alternation requirement.
+ * - Ensures first message is "user" role
+ * - Merges consecutive same-role messages by combining their parts
+ */
+function enforceRoleAlternation(contents: any[]): any[] {
+  if (contents.length === 0) return contents;
+
+  // Ensure first content is user role
+  if (contents[0].role !== "user") {
+    contents.unshift({ role: "user", parts: [{ text: "" }] });
+  }
+
+  // Merge consecutive same-role messages
+  const merged: any[] = [contents[0]];
+  for (let i = 1; i < contents.length; i++) {
+    const prev = merged[merged.length - 1];
+    if (contents[i].role === prev.role) {
+      prev.parts = prev.parts.concat(contents[i].parts);
+    } else {
+      merged.push(contents[i]);
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Backfill empty functionResponse names from preceding model functionCall names.
+ * Walks contents and tracks functionCall names from model turns.
+ * For user turns with functionResponse parts that have empty names,
+ * fills from the tracked names queue in order.
+ */
+function backfillFunctionResponseNames(contents: any[]): void {
+  const pendingCallNames: string[] = [];
+
+  for (const content of contents) {
+    if (content.role === "model") {
+      for (const part of content.parts || []) {
+        if (part.functionCall?.name) {
+          pendingCallNames.push(part.functionCall.name);
+        }
+      }
+    } else if (content.role === "user") {
+      for (const part of content.parts || []) {
+        if (part.functionResponse && !part.functionResponse.name) {
+          const name = pendingCallNames.shift();
+          if (name) {
+            part.functionResponse.name = name;
+          }
+        }
+      }
+    }
+  }
 }

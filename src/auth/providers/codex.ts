@@ -7,7 +7,7 @@ const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REDIRECT_URI = "http://localhost:1455/auth/callback";
 const AUTH_SCOPE = "openid email profile offline_access";
 
-const REFRESH_LEAD_MS = 5 * 24 * 60 * 60 * 1000; // 5 days before expiry
+const REFRESH_LEAD_MS = 5 * 60 * 1000; // 5 minutes before expiry
 
 /**
  * Parse a JWT token without verifying its signature.
@@ -35,7 +35,6 @@ export class CodexAuthProvider implements AuthProvider {
       state,
       scope: AUTH_SCOPE,
       prompt: "login",
-      id_token_add_organizations: "true",
       codex_cli_simplified_flow: "true",
     });
     return `${AUTH_URL}?${params.toString()}`;
@@ -86,7 +85,12 @@ export class CodexAuthProvider implements AuthProvider {
 
     if (!resp.ok) {
       const text = await resp.text();
-      throw new Error(`Token refresh failed (${resp.status}): ${text}`);
+      const err = new Error(`Token refresh failed (${resp.status}): ${text}`);
+      // Mark non-retryable errors so refreshTokensWithRetry can bail out early
+      if (text.includes("refresh_token_reused") || text.includes("invalid_grant")) {
+        (err as any).nonRetryable = true;
+      }
+      throw err;
     }
 
     const data: any = await resp.json();
@@ -105,7 +109,11 @@ export class CodexAuthProvider implements AuthProvider {
       try {
         const claims = parseJWT(data.id_token);
         email = claims.email || "unknown";
-        accountUuid = claims.sub || "";
+        // Use chatgpt_account_id from the OpenAI auth claim, NOT sub.
+        // sub is the auth0 user ID; chatgpt_account_id is what the
+        // Chatgpt-Account-Id header requires.
+        const authInfo = claims["https://api.openai.com/auth"];
+        accountUuid = authInfo?.chatgpt_account_id || claims.sub || "";
       } catch {
         // JWT parse failure, use defaults
       }
