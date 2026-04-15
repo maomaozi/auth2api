@@ -25,6 +25,7 @@ import {
   RETRYABLE_STATUSES,
   classifyFailure,
   extractUsage,
+  extractProviderUsage,
   sendUpstreamError,
   callUpstream,
   isCodexModelCapacityError,
@@ -251,23 +252,6 @@ function translateResponse(provider: ProviderType, respData: any, model: string,
     case "gemini":
       return geminiToOpenAI(respData, model);
   }
-}
-
-/**
- * Extract usage data from a provider-specific response.
- */
-function extractProviderUsage(provider: ProviderType, respData: any): UsageData {
-  if (provider === "gemini") {
-    const data = respData.response || respData;
-    const u = data.usageMetadata;
-    return {
-      inputTokens: u?.promptTokenCount || 0,
-      outputTokens: u?.candidatesTokenCount || 0,
-      cacheCreationInputTokens: 0,
-      cacheReadInputTokens: u?.cachedContentTokenCount || 0,
-    };
-  }
-  return extractUsage(respData);
 }
 
 /**

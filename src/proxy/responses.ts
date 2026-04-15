@@ -14,6 +14,7 @@ import {
   sendUpstreamError,
   callUpstream,
   EFFORT_TO_BUDGET,
+  formatSSEEvent,
 } from "./shared";
 import { openaiToGeminiCLI } from "./gemini-translator";
 
@@ -467,10 +468,6 @@ function makeResponsesState(): ResponsesStreamState {
   };
 }
 
-function emitEvent(event: string, data: any): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
 function claudeSSEToResponses(
   event: string,
   data: any,
@@ -486,7 +483,7 @@ function claudeSSEToResponses(
     state.cacheCreationInputTokens = usage?.cache_creation_input_tokens || 0;
     state.cacheReadInputTokens = usage?.cache_read_input_tokens || 0;
     out.push(
-      emitEvent("response.created", {
+      formatSSEEvent("response.created", {
         type: "response.created",
         sequence_number: nextSeq(),
         response: {
@@ -500,7 +497,7 @@ function claudeSSEToResponses(
       }),
     );
     out.push(
-      emitEvent("response.in_progress", {
+      formatSSEEvent("response.in_progress", {
         type: "response.in_progress",
         sequence_number: nextSeq(),
         response: {
@@ -524,7 +521,7 @@ function claudeSSEToResponses(
       state.inTextBlock = true;
       state.currentText = "";
       out.push(
-        emitEvent("response.output_item.added", {
+        formatSSEEvent("response.output_item.added", {
           type: "response.output_item.added",
           sequence_number: nextSeq(),
           output_index: idx,
@@ -538,7 +535,7 @@ function claudeSSEToResponses(
         }),
       );
       out.push(
-        emitEvent("response.content_part.added", {
+        formatSSEEvent("response.content_part.added", {
           type: "response.content_part.added",
           sequence_number: nextSeq(),
           item_id: state.msgId,
@@ -556,7 +553,7 @@ function claudeSSEToResponses(
       state.currentToolArgs = "";
       const fcId = `fc_${block.id}`;
       out.push(
-        emitEvent("response.output_item.added", {
+        formatSSEEvent("response.output_item.added", {
           type: "response.output_item.added",
           sequence_number: nextSeq(),
           output_index: idx,
@@ -582,7 +579,7 @@ function claudeSSEToResponses(
     if (deltaType === "text_delta") {
       state.currentText += data.delta.text;
       out.push(
-        emitEvent("response.output_text.delta", {
+        formatSSEEvent("response.output_text.delta", {
           type: "response.output_text.delta",
           sequence_number: nextSeq(),
           item_id: state.msgId,
@@ -598,7 +595,7 @@ function claudeSSEToResponses(
     } else if (deltaType === "input_json_delta") {
       state.currentToolArgs += data.delta.partial_json;
       out.push(
-        emitEvent("response.function_call_arguments.delta", {
+        formatSSEEvent("response.function_call_arguments.delta", {
           type: "response.function_call_arguments.delta",
           sequence_number: nextSeq(),
           item_id: `fc_${state.currentToolId}`,
@@ -614,7 +611,7 @@ function claudeSSEToResponses(
     const idx = data.index;
     if (state.inTextBlock) {
       out.push(
-        emitEvent("response.output_text.done", {
+        formatSSEEvent("response.output_text.done", {
           type: "response.output_text.done",
           sequence_number: nextSeq(),
           item_id: state.msgId,
@@ -624,7 +621,7 @@ function claudeSSEToResponses(
         }),
       );
       out.push(
-        emitEvent("response.content_part.done", {
+        formatSSEEvent("response.content_part.done", {
           type: "response.content_part.done",
           sequence_number: nextSeq(),
           item_id: state.msgId,
@@ -638,7 +635,7 @@ function claudeSSEToResponses(
         }),
       );
       out.push(
-        emitEvent("response.output_item.done", {
+        formatSSEEvent("response.output_item.done", {
           type: "response.output_item.done",
           sequence_number: nextSeq(),
           output_index: idx,
@@ -658,7 +655,7 @@ function claudeSSEToResponses(
     } else if (state.inToolBlock) {
       const fcId = `fc_${state.currentToolId}`;
       out.push(
-        emitEvent("response.function_call_arguments.done", {
+        formatSSEEvent("response.function_call_arguments.done", {
           type: "response.function_call_arguments.done",
           sequence_number: nextSeq(),
           item_id: fcId,
@@ -667,7 +664,7 @@ function claudeSSEToResponses(
         }),
       );
       out.push(
-        emitEvent("response.output_item.done", {
+        formatSSEEvent("response.output_item.done", {
           type: "response.output_item.done",
           sequence_number: nextSeq(),
           output_index: idx,
@@ -693,7 +690,7 @@ function claudeSSEToResponses(
 
   if (event === "message_stop") {
     out.push(
-      emitEvent("response.completed", {
+      formatSSEEvent("response.completed", {
         type: "response.completed",
         sequence_number: nextSeq(),
         response: {

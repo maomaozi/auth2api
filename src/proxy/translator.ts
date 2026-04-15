@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import { EFFORT_TO_BUDGET } from "./shared";
+import { EFFORT_TO_BUDGET, formatSSEEvent } from "./shared";
 
 // ── Model alias resolution ──
 
@@ -247,6 +247,369 @@ export function claudeToOpenai(claudeResp: any, model: string): any {
         (claudeResp.usage?.output_tokens || 0),
     },
   };
+}
+
+// ── Claude messages request → OpenAI chat completion request (reverse of openaiToClaude) ──
+
+function budgetToEffort(budget: number): string {
+  if (budget <= 0) return "none";
+  if (budget <= 1024) return "low";
+  if (budget <= 8192) return "medium";
+  if (budget <= 24576) return "high";
+  return "xhigh";
+}
+
+function reverseToolChoice(tc: any): any {
+  if (!tc) return undefined;
+  if (tc.type === "auto") return "auto";
+  if (tc.type === "any") return "required";
+  if (tc.type === "none") return "none";
+  if (tc.type === "tool" && tc.name) {
+    return { type: "function", function: { name: tc.name } };
+  }
+  return tc;
+}
+
+export function claudeRequestToOpenai(body: any): any {
+  const openaiBody: any = {
+    model: body.model,
+    max_tokens: body.max_tokens || 8192,
+    stream: !!body.stream,
+  };
+
+  if (body.temperature !== undefined) openaiBody.temperature = body.temperature;
+  if (body.top_p !== undefined) openaiBody.top_p = body.top_p;
+  if (body.stop_sequences) {
+    openaiBody.stop = body.stop_sequences;
+  }
+
+  // thinking → reasoning_effort
+  if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {
+    openaiBody.reasoning_effort = budgetToEffort(body.thinking.budget_tokens);
+  }
+
+  const messages: any[] = [];
+
+  // system → system message
+  if (body.system) {
+    const parts = Array.isArray(body.system) ? body.system : [body.system];
+    const text = parts
+      .map((p: any) => (typeof p === "string" ? p : p.text || ""))
+      .join("\n");
+    if (text) messages.push({ role: "system", content: text });
+  }
+
+  // Claude messages → OpenAI messages
+  for (const msg of body.messages || []) {
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        messages.push({ role: "user", content: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        const parts: any[] = [];
+        const toolResults: any[] = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            parts.push({ type: "text", text: block.text });
+          } else if (block.type === "image") {
+            if (block.source?.type === "base64") {
+              parts.push({
+                type: "image_url",
+                image_url: {
+                  url: `data:${block.source.media_type};base64,${block.source.data}`,
+                },
+              });
+            } else if (block.source?.type === "url") {
+              parts.push({
+                type: "image_url",
+                image_url: { url: block.source.url },
+              });
+            }
+          } else if (block.type === "tool_result") {
+            toolResults.push({
+              role: "tool",
+              tool_call_id: block.tool_use_id,
+              content:
+                typeof block.content === "string"
+                  ? block.content
+                  : JSON.stringify(block.content),
+            });
+          }
+        }
+        if (parts.length) {
+          messages.push({
+            role: "user",
+            content:
+              parts.length === 1 && parts[0].type === "text"
+                ? parts[0].text
+                : parts,
+          });
+        }
+        messages.push(...toolResults);
+      }
+    } else if (msg.role === "assistant") {
+      if (typeof msg.content === "string") {
+        messages.push({ role: "assistant", content: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        const textParts: string[] = [];
+        const toolCalls: any[] = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            textParts.push(block.text);
+          } else if (block.type === "tool_use") {
+            toolCalls.push({
+              id: block.id,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input || {}),
+              },
+            });
+          }
+          // thinking / redacted_thinking — skip
+        }
+        const assistantMsg: any = {
+          role: "assistant",
+          content: textParts.join("") || null,
+        };
+        if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
+        messages.push(assistantMsg);
+      }
+    }
+  }
+
+  openaiBody.messages = messages;
+
+  // tools: input_schema → parameters
+  if (body.tools) {
+    openaiBody.tools = body.tools.map((t: any) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description || "",
+        parameters: t.input_schema || t.parameters || {
+          type: "object",
+          properties: {},
+        },
+      },
+    }));
+  }
+
+  // tool_choice: Claude → OpenAI
+  if (body.tool_choice) {
+    const converted = reverseToolChoice(body.tool_choice);
+    if (converted !== undefined) openaiBody.tool_choice = converted;
+  }
+
+  return openaiBody;
+}
+
+// ── OpenAI chat completion response → Claude messages response (reverse of claudeToOpenai) ──
+
+function mapFinishReason(reason: string): string {
+  if (reason === "stop") return "end_turn";
+  if (reason === "length") return "max_tokens";
+  if (reason === "tool_calls") return "tool_use";
+  return "end_turn";
+}
+
+export function openaiResponseToClaude(resp: any, model: string): any {
+  const choice = resp.choices?.[0];
+  const msg = choice?.message;
+  const content: any[] = [];
+
+  if (msg?.content) {
+    content.push({ type: "text", text: msg.content });
+  }
+
+  if (msg?.tool_calls) {
+    for (const tc of msg.tool_calls) {
+      let input = {};
+      try {
+        input = JSON.parse(tc.function?.arguments || "{}");
+      } catch { /* ignore */ }
+      content.push({
+        type: "tool_use",
+        id: tc.id,
+        name: tc.function?.name || "",
+        input,
+      });
+    }
+  }
+
+  return {
+    id: resp.id || `msg_${uuidv4()}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model,
+    stop_reason: mapFinishReason(choice?.finish_reason || "stop"),
+    stop_sequence: null,
+    usage: {
+      input_tokens: resp.usage?.prompt_tokens || 0,
+      output_tokens: resp.usage?.completion_tokens || 0,
+    },
+  };
+}
+
+// ── OpenAI SSE chunk → Claude SSE events (reverse of claudeStreamEventToOpenai) ──
+
+export interface ReverseStreamState {
+  msgId: string;
+  model: string;
+  started: boolean;
+  blockIndex: number;
+  textBlockOpen: boolean;
+  toolBlockOpen: boolean;
+  currentToolId: string;
+  currentToolName: string;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export function createReverseStreamState(model: string): ReverseStreamState {
+  return {
+    msgId: `msg_${uuidv4()}`,
+    model,
+    started: false,
+    blockIndex: 0,
+    textBlockOpen: false,
+    toolBlockOpen: false,
+    currentToolId: "",
+    currentToolName: "",
+    inputTokens: 0,
+    outputTokens: 0,
+  };
+}
+
+function closeContentBlock(
+  events: string[],
+  state: ReverseStreamState,
+  kind: "text" | "tool",
+  advance: boolean,
+): void {
+  events.push(
+    formatSSEEvent("content_block_stop", {
+      type: "content_block_stop",
+      index: state.blockIndex,
+    }),
+  );
+  if (advance) state.blockIndex++;
+  if (kind === "text") state.textBlockOpen = false;
+  else state.toolBlockOpen = false;
+}
+
+export function openaiStreamChunkToClaudeEvents(
+  chunk: any,
+  state: ReverseStreamState,
+): string[] {
+  const events: string[] = [];
+  const choice = chunk.choices?.[0];
+  if (!choice) return events;
+
+  const delta = choice.delta;
+  const finishReason = choice.finish_reason;
+
+  // First chunk: emit message_start
+  if (!state.started && delta) {
+    state.started = true;
+    events.push(
+      formatSSEEvent("message_start", {
+        type: "message_start",
+        message: {
+          id: state.msgId,
+          type: "message",
+          role: "assistant",
+          content: [],
+          model: state.model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: chunk.usage?.prompt_tokens || 0, output_tokens: 0 },
+        },
+      }),
+    );
+    state.inputTokens = chunk.usage?.prompt_tokens || 0;
+  }
+
+  // Text content delta
+  if (delta?.content) {
+    if (!state.textBlockOpen) {
+      if (state.toolBlockOpen) closeContentBlock(events, state, "tool", true);
+      events.push(
+        formatSSEEvent("content_block_start", {
+          type: "content_block_start",
+          index: state.blockIndex,
+          content_block: { type: "text", text: "" },
+        }),
+      );
+      state.textBlockOpen = true;
+    }
+    events.push(
+      formatSSEEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: { type: "text_delta", text: delta.content },
+      }),
+    );
+  }
+
+  // Tool calls delta
+  if (delta?.tool_calls) {
+    for (const tc of delta.tool_calls) {
+      // New tool call (has id and name)
+      if (tc.id && tc.function?.name) {
+        if (state.textBlockOpen) closeContentBlock(events, state, "text", true);
+        if (state.toolBlockOpen) closeContentBlock(events, state, "tool", true);
+        state.currentToolId = tc.id;
+        state.currentToolName = tc.function.name;
+        events.push(
+          formatSSEEvent("content_block_start", {
+            type: "content_block_start",
+            index: state.blockIndex,
+            content_block: {
+              type: "tool_use",
+              id: tc.id,
+              name: tc.function.name,
+            },
+          }),
+        );
+        state.toolBlockOpen = true;
+      }
+
+      // Tool arguments delta
+      if (tc.function?.arguments) {
+        events.push(
+          formatSSEEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: {
+              type: "input_json_delta",
+              partial_json: tc.function.arguments,
+            },
+          }),
+        );
+      }
+    }
+  }
+
+  // Finish reason: close blocks, emit message_delta + message_stop
+  if (finishReason) {
+    if (state.textBlockOpen) closeContentBlock(events, state, "text", false);
+    if (state.toolBlockOpen) closeContentBlock(events, state, "tool", false);
+
+    state.outputTokens = chunk.usage?.completion_tokens || 0;
+    events.push(
+      formatSSEEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: mapFinishReason(finishReason) },
+        usage: { output_tokens: state.outputTokens },
+      }),
+    );
+    events.push(
+      formatSSEEvent("message_stop", { type: "message_stop" }),
+    );
+  }
+
+  return events;
 }
 
 // ── Streaming state tracker ──

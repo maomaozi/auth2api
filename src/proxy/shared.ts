@@ -67,6 +67,27 @@ export function extractUsage(resp: any): UsageData {
   };
 }
 
+export function extractProviderUsage(provider: ProviderType, respData: any): UsageData {
+  if (provider === "gemini") {
+    const data = respData.response || respData;
+    const u = data.usageMetadata;
+    return {
+      inputTokens: u?.promptTokenCount || 0,
+      outputTokens: u?.candidatesTokenCount || 0,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: u?.cachedContentTokenCount || 0,
+    };
+  }
+  return extractUsage(respData);
+}
+
+/**
+ * Format an SSE event string. Used by responses.ts and translator.ts.
+ */
+export function formatSSEEvent(event: string, data: any): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
 /**
  * Call the appropriate upstream API based on provider type.
  */
