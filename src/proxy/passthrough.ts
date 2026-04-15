@@ -18,6 +18,10 @@ import {
   codexSSEToOpenAI,
   createCodexStreamState,
   ToolNameMap,
+  claudeToCodexRequest,
+  codexResponseToClaudeDirect,
+  codexSSEToClaudeEvents,
+  createCodexToClaudeStreamState,
 } from "./codex-translator";
 import {
   openaiToGeminiCLI,
@@ -308,18 +312,20 @@ async function handleNonClaudeMessages(
 ): Promise<void> {
   const model = resolveModelAlias(rawModel);
 
-  // Convert Claude Messages body → OpenAI Chat Completions body
-  const openaiBody = claudeRequestToOpenai(body);
-
   if (isDebugLevel(config.debug, "verbose")) {
     console.log(`[DEBUG] /v1/messages routed to provider: ${provider}, model: ${model}`);
   }
 
-  // Pre-compute body for non-Gemini providers
-  const precomputed =
-    provider !== "gemini"
-      ? prepareProviderBody(provider, openaiBody, model, "")
-      : null;
+  // Prepare request body:
+  // - Codex: direct Claude → Codex translation (no intermediate OpenAI format)
+  // - Gemini: Claude → OpenAI → Gemini (needs per-account projectId, computed in loop)
+  let precomputed: { body: any; toolNameMap: ToolNameMap } | null = null;
+  if (provider === "codex") {
+    precomputed = claudeToCodexRequest({ ...body, model });
+  } else if (provider !== "gemini") {
+    const openaiBody = claudeRequestToOpenai(body);
+    precomputed = prepareProviderBody(provider, openaiBody, model, "");
+  }
 
   let lastStatus = 500;
   let lastErrBody = "";
@@ -339,7 +345,9 @@ async function handleNonClaudeMessages(
     manager.recordAttempt(account.token.email, provider, tracking);
 
     // Gemini needs per-account projectId
-    const prepared = precomputed || prepareProviderBody(provider, openaiBody, model, account.projectId);
+    const prepared = precomputed || prepareProviderBody(
+      provider, claudeRequestToOpenai(body), model, account.projectId,
+    );
     const toolNameMap = prepared.toolNameMap;
 
     if (isDebugLevel(config.debug, "verbose")) {
@@ -375,16 +383,27 @@ async function handleNonClaudeMessages(
 
     if (upstreamResp.ok) {
       if (stream) {
-        await handleProviderToClaudeStream(
-          provider, upstreamResp, res, model, account, manager, tracking, toolNameMap,
-        );
+        if (provider === "codex") {
+          // Direct Codex SSE → Claude SSE (no intermediate OpenAI format)
+          await handleCodexDirectStream(
+            upstreamResp, res, model, account, manager, tracking, toolNameMap,
+          );
+        } else {
+          await handleProviderToClaudeStream(
+            provider, upstreamResp, res, model, account, manager, tracking, toolNameMap,
+          );
+        }
       } else {
         const respData = await upstreamResp.json();
         manager.recordSuccess(account.token.email, provider, tracking);
-        const openaiResp = translateProviderResponse(provider, respData, model, toolNameMap);
         manager.recordUsage(account.token.email, extractProviderUsage(provider, respData), provider, tracking);
-        // Convert OpenAI response → Claude Messages response
-        res.json(openaiResponseToClaude(openaiResp, model));
+        if (provider === "codex") {
+          // Direct Codex → Claude response (no intermediate OpenAI format)
+          res.json(codexResponseToClaudeDirect(respData, model, toolNameMap));
+        } else {
+          const openaiResp = translateProviderResponse(provider, respData, model, toolNameMap);
+          res.json(openaiResponseToClaude(openaiResp, model));
+        }
       }
       return;
     }
@@ -433,6 +452,84 @@ async function handleNonClaudeMessages(
   }
 
   sendUpstreamError(res, lastStatus, lastErrBody);
+}
+
+/**
+ * Handle streaming from Codex, translating SSE directly to Claude Messages SSE format.
+ * Pipeline: Codex SSE → Claude SSE events (no intermediate OpenAI format)
+ */
+async function handleCodexDirectStream(
+  upstreamResp: globalThis.Response,
+  res: ExpressResponse,
+  model: string,
+  account: { token: { email: string }; accountUuid: string; projectId: string },
+  manager: AccountManager,
+  tracking: TrackingContext,
+  toolNameMap?: ToolNameMap,
+): Promise<void> {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const reader = upstreamResp.body?.getReader();
+  if (!reader) { res.end(); return; }
+
+  let clientDisconnected = false;
+  let sseBuffer = "";
+  const decoder = new TextDecoder();
+  const state = createCodexToClaudeStreamState(model, toolNameMap);
+
+  res.on("close", () => {
+    clientDisconnected = true;
+    reader.cancel().catch(() => {});
+  });
+
+  try {
+    while (!clientDisconnected) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const lines = sseBuffer.split("\n");
+      sseBuffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (clientDisconnected) break;
+        if (!line.startsWith("data:")) continue;
+        const raw = line.slice(5).trim();
+        if (!raw || raw === "[DONE]") continue;
+
+        try {
+          const data = JSON.parse(raw);
+          const claudeEvents = codexSSEToClaudeEvents(data, state);
+          for (const event of claudeEvents) {
+            if (!clientDisconnected) res.write(event);
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    }
+
+    if (!clientDisconnected) {
+      manager.recordSuccess(account.token.email, "codex", tracking);
+      manager.recordUsage(account.token.email, {
+        inputTokens: state.inputTokens,
+        outputTokens: state.outputTokens,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+      }, "codex", tracking);
+    }
+  } catch {
+    if (!clientDisconnected) {
+      manager.recordFailure(
+        account.token.email, "network",
+        "stream terminated before completion", "codex", tracking,
+      );
+    }
+  } finally {
+    if (!clientDisconnected) res.end();
+  }
 }
 
 /**
