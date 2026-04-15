@@ -40,12 +40,20 @@ export async function callCodexAPI(
     ? timeouts["stream-messages-ms"]
     : timeouts["messages-ms"];
 
-  // Build clean body — avoid mutating the caller's object
+  // Build clean body — strip fields unsupported by Codex backend
   const {
     previous_response_id,
     stream_options,
     prompt_cache_retention,
     safety_identifier,
+    max_output_tokens,
+    max_completion_tokens,
+    temperature,
+    top_p,
+    service_tier,
+    truncation,
+    context_management,
+    user,
     ...cleanBody
   } = body;
   cleanBody.stream = stream;

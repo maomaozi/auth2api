@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import { EFFORT_TO_BUDGET, formatSSEEvent } from "./shared";
+import { EFFORT_TO_BUDGET, budgetToEffort, formatSSEEvent } from "./shared";
 
 // ── Model alias resolution ──
 
@@ -250,14 +250,6 @@ export function claudeToOpenai(claudeResp: any, model: string): any {
 }
 
 // ── Claude messages request → OpenAI chat completion request (reverse of openaiToClaude) ──
-
-function budgetToEffort(budget: number): string {
-  if (budget <= 0) return "none";
-  if (budget <= 1024) return "low";
-  if (budget <= 8192) return "medium";
-  if (budget <= 24576) return "high";
-  return "xhigh";
-}
 
 function reverseToolChoice(tc: any): any {
   if (!tc) return undefined;

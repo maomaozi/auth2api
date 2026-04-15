@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
+import { formatSSEEvent } from "./shared";
 
 // ── Default safety settings (match CLIProxyAPI reference) ──
 
@@ -141,20 +142,11 @@ export function openaiToGeminiCLI(body: any, projectId: string): any {
   if (body.tools) {
     const functionDeclarations = body.tools
       .filter((t: any) => t.type === "function" && t.function)
-      .map((t: any) => {
-        const params = { ...(t.function.parameters || { type: "object", properties: {} }) };
-        // Remove $schema which Gemini doesn't accept
-        delete params.$schema;
-        // Enforce strict object validation
-        if (params.type === "object") {
-          params.additionalProperties = false;
-        }
-        return {
-          name: t.function.name,
-          description: t.function.description || "",
-          parametersJsonSchema: params,
-        };
-      });
+      .map((t: any) => ({
+        name: t.function.name,
+        description: t.function.description || "",
+        parametersJsonSchema: cleanSchemaForGemini(t.function.parameters),
+      }));
     if (functionDeclarations.length) {
       request.tools = [{ functionDeclarations }];
     }
@@ -445,4 +437,421 @@ function backfillFunctionResponseNames(contents: any[]): void {
       }
     }
   }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Direct Claude Messages API ↔ Gemini translators
+// (bypass intermediate OpenAI Chat Completions format)
+// ══════════════════════════════════════════════════════════════════
+
+// ── Helper: convert Claude image source to Gemini part ──
+
+function claudeImageToGeminiPart(block: any): any | null {
+  if (block.source?.type === "base64") {
+    return {
+      inlineData: {
+        mimeType: block.source.media_type || "application/octet-stream",
+        data: block.source.data,
+      },
+    };
+  }
+  if (block.source?.type === "url") {
+    return {
+      fileData: {
+        fileUri: block.source.url,
+        mimeType: "image/jpeg",
+      },
+    };
+  }
+  return null;
+}
+
+// ── Helper: clean schema for Gemini ──
+
+function cleanSchemaForGemini(schema: any): any {
+  if (!schema) return { type: "object", properties: {} };
+  const params = { ...schema };
+  delete params.$schema;
+  if (params.type === "object") {
+    params.additionalProperties = false;
+  }
+  return params;
+}
+
+// ── Claude Messages request → Gemini CLI native format (direct) ──
+
+export function claudeToGeminiCLI(body: any, projectId: string): any {
+  const model = body.model || "gemini-2.5-pro";
+
+  const request: any = {
+    contents: [],
+    generationConfig: {},
+  };
+
+  // system → systemInstruction
+  if (body.system) {
+    const parts = Array.isArray(body.system) ? body.system : [body.system];
+    const systemParts: any[] = [];
+    for (const p of parts) {
+      const text = typeof p === "string" ? p : p.text || "";
+      if (text) systemParts.push({ text });
+    }
+    if (systemParts.length) {
+      request.systemInstruction = { role: "user", parts: systemParts };
+    }
+  }
+
+  // Claude messages → Gemini contents
+  const contents: any[] = [];
+  // Track tool_use names from assistant for backfilling functionResponse
+  const pendingToolNames: string[] = [];
+
+  for (const msg of body.messages || []) {
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        contents.push({ role: "user", parts: [{ text: msg.content }] });
+      } else if (Array.isArray(msg.content)) {
+        const userParts: any[] = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            userParts.push({ text: block.text });
+          } else if (block.type === "image") {
+            const gp = claudeImageToGeminiPart(block);
+            if (gp) userParts.push(gp);
+          } else if (block.type === "tool_result") {
+            // tool_result → functionResponse (user role)
+            let response: any;
+            if (typeof block.content === "string") {
+              try { response = JSON.parse(block.content); }
+              catch { response = { result: block.content }; }
+            } else if (Array.isArray(block.content)) {
+              const texts = block.content
+                .filter((c: any) => c.type === "text")
+                .map((c: any) => c.text)
+                .join("\n");
+              response = texts ? { result: texts } : { result: JSON.stringify(block.content) };
+            } else {
+              response = block.content || { result: "" };
+            }
+            // Get function name from pending queue
+            const name = pendingToolNames.shift() || "";
+            userParts.push({
+              functionResponse: { name, response },
+            });
+          }
+        }
+        if (userParts.length) contents.push({ role: "user", parts: userParts });
+      }
+    } else if (msg.role === "assistant") {
+      if (typeof msg.content === "string") {
+        if (msg.content) contents.push({ role: "model", parts: [{ text: msg.content }] });
+      } else if (Array.isArray(msg.content)) {
+        const modelParts: any[] = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            modelParts.push({ text: block.text });
+          } else if (block.type === "tool_use") {
+            // Track name for backfill
+            pendingToolNames.push(block.name || "");
+            let args: any = {};
+            if (typeof block.input === "string") {
+              try { args = JSON.parse(block.input); } catch { /* ignore */ }
+            } else {
+              args = block.input || {};
+            }
+            modelParts.push({
+              functionCall: { name: block.name || "", args },
+              thoughtSignature: "skip_thought_signature_validator",
+            });
+          }
+          // thinking, redacted_thinking → skip
+        }
+        if (modelParts.length) contents.push({ role: "model", parts: modelParts });
+      }
+    }
+  }
+
+  // Enforce role alternation
+  request.contents = enforceRoleAlternation(contents);
+
+  // Safety settings
+  request.safetySettings = DEFAULT_SAFETY_SETTINGS;
+
+  // Generation config
+  const genConfig: any = {};
+  if (body.max_tokens) genConfig.maxOutputTokens = body.max_tokens;
+  if (body.temperature !== undefined) genConfig.temperature = body.temperature;
+  if (body.top_p !== undefined) genConfig.topP = body.top_p;
+  if (body.stop_sequences) {
+    genConfig.stopSequences = body.stop_sequences;
+  }
+  if (Object.keys(genConfig).length) request.generationConfig = genConfig;
+
+  // thinking → thinkingConfig
+  if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {
+    request.generationConfig.thinkingConfig = {
+      thinkingBudget: body.thinking.budget_tokens,
+      includeThoughts: true,
+    };
+  } else if (body.thinking?.type === "disabled") {
+    request.generationConfig.thinkingConfig = { thinkingLevel: "none" };
+  }
+
+  // Tools (Claude format: name/description/input_schema)
+  if (body.tools) {
+    const functionDeclarations = body.tools
+      .filter((t: any) => t.name) // Claude tools have name at top level
+      .map((t: any) => ({
+        name: t.name,
+        description: t.description || "",
+        parametersJsonSchema: cleanSchemaForGemini(t.input_schema || t.parameters),
+      }));
+    if (functionDeclarations.length) {
+      request.tools = [{ functionDeclarations }];
+    }
+  }
+
+  // tool_choice → toolConfig
+  if (body.tool_choice) {
+    const tc = body.tool_choice;
+    if (tc.type === "auto") {
+      request.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+    } else if (tc.type === "none") {
+      request.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    } else if (tc.type === "any") {
+      request.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+    } else if (tc.type === "tool" && tc.name) {
+      request.toolConfig = {
+        functionCallingConfig: {
+          mode: "ANY",
+          allowedFunctionNames: [tc.name],
+        },
+      };
+    }
+  }
+
+  return { project: projectId, model, request };
+}
+
+// ── Gemini response → Claude Messages response (non-streaming, direct) ──
+
+export function geminiResponseToClaudeDirect(respData: any, model: string): any {
+  const data = respData.response || respData;
+  const candidate = data.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+  const content: any[] = [];
+  let hasToolUse = false;
+
+  for (const part of parts) {
+    if (part.thought === true && part.text !== undefined) {
+      content.push({ type: "thinking", thinking: part.text });
+    } else if (part.text !== undefined) {
+      content.push({ type: "text", text: part.text });
+    } else if (part.functionCall) {
+      hasToolUse = true;
+      content.push({
+        type: "tool_use",
+        id: `toolu_${uuidv4().replace(/-/g, "").slice(0, 24)}`,
+        name: part.functionCall.name || "",
+        input: part.functionCall.args || {},
+      });
+    }
+  }
+
+  const finishReason = candidate?.finishReason;
+  let stopReason: string;
+  if (hasToolUse) {
+    stopReason = "tool_use";
+  } else if (finishReason === "MAX_TOKENS") {
+    stopReason = "max_tokens";
+  } else {
+    stopReason = "end_turn";
+  }
+
+  const usage = data.usageMetadata;
+  return {
+    id: `msg_${uuidv4()}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage?.promptTokenCount || 0,
+      output_tokens: (usage?.candidatesTokenCount || 0) + (usage?.thoughtsTokenCount || 0),
+    },
+  };
+}
+
+// ── Gemini SSE → Claude SSE (streaming, direct) ──
+
+const RESP_NONE = 0;
+const RESP_TEXT = 1;
+const RESP_THINKING = 2;
+const RESP_TOOL = 3;
+
+export interface GeminiToClaudeStreamState {
+  model: string;
+  blockIndex: number;
+  responseType: number;
+  started: boolean;
+  hasToolCall: boolean;
+  hasContent: boolean;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export function createGeminiToClaudeStreamState(model: string): GeminiToClaudeStreamState {
+  return {
+    model,
+    blockIndex: 0,
+    responseType: RESP_NONE,
+    started: false,
+    hasToolCall: false,
+    hasContent: false,
+    inputTokens: 0,
+    outputTokens: 0,
+  };
+}
+
+function closeBlock(events: string[], state: GeminiToClaudeStreamState): void {
+  if (state.responseType !== RESP_NONE) {
+    events.push(formatSSEEvent("content_block_stop", {
+      type: "content_block_stop",
+      index: state.blockIndex,
+    }));
+    state.blockIndex++;
+    state.responseType = RESP_NONE;
+  }
+}
+
+/**
+ * Convert a Gemini SSE data chunk directly to Claude Messages SSE events.
+ * No intermediate OpenAI format — direct translation.
+ */
+export function geminiSSEToClaudeEvents(
+  data: any,
+  state: GeminiToClaudeStreamState,
+): string[] {
+  const events: string[] = [];
+
+  // Unwrap Gemini CLI envelope
+  const respData = data.response || data;
+
+  // First chunk: emit message_start
+  if (!state.started) {
+    state.started = true;
+    events.push(formatSSEEvent("message_start", {
+      type: "message_start",
+      message: {
+        id: `msg_${uuidv4()}`,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: state.model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }));
+  }
+
+  const candidate = respData.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+
+  for (const part of parts) {
+    if (part.thought === true && part.text !== undefined) {
+      // Thinking part
+      if (state.responseType !== RESP_THINKING) {
+        closeBlock(events, state);
+        events.push(formatSSEEvent("content_block_start", {
+          type: "content_block_start",
+          index: state.blockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        }));
+        state.responseType = RESP_THINKING;
+      }
+      events.push(formatSSEEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: { type: "thinking_delta", thinking: part.text },
+      }));
+      state.hasContent = true;
+    } else if (part.text !== undefined) {
+      // Text part
+      if (state.responseType !== RESP_TEXT) {
+        closeBlock(events, state);
+        events.push(formatSSEEvent("content_block_start", {
+          type: "content_block_start",
+          index: state.blockIndex,
+          content_block: { type: "text", text: "" },
+        }));
+        state.responseType = RESP_TEXT;
+      }
+      events.push(formatSSEEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: { type: "text_delta", text: part.text },
+      }));
+      state.hasContent = true;
+    } else if (part.functionCall) {
+      // Function call — each is a separate tool_use block
+      closeBlock(events, state);
+      state.hasToolCall = true;
+      const toolId = `toolu_${uuidv4().replace(/-/g, "").slice(0, 24)}`;
+      events.push(formatSSEEvent("content_block_start", {
+        type: "content_block_start",
+        index: state.blockIndex,
+        content_block: {
+          type: "tool_use",
+          id: toolId,
+          name: part.functionCall.name || "",
+        },
+      }));
+      // Emit full args as single input_json_delta
+      const argsStr = JSON.stringify(part.functionCall.args || {});
+      events.push(formatSSEEvent("content_block_delta", {
+        type: "content_block_delta",
+        index: state.blockIndex,
+        delta: { type: "input_json_delta", partial_json: argsStr },
+      }));
+      state.responseType = RESP_TOOL;
+      state.hasContent = true;
+    }
+  }
+
+  // Usage metadata
+  const usage = respData.usageMetadata;
+  if (usage) {
+    state.inputTokens = usage.promptTokenCount || 0;
+    state.outputTokens = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
+  }
+
+  // Finish reason
+  const finishReason = candidate?.finishReason;
+  if (finishReason && state.hasContent) {
+    closeBlock(events, state);
+
+    let stopReason: string;
+    if (state.hasToolCall) {
+      stopReason = "tool_use";
+    } else if (finishReason === "MAX_TOKENS") {
+      stopReason = "max_tokens";
+    } else {
+      stopReason = "end_turn";
+    }
+
+    events.push(formatSSEEvent("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: {
+        input_tokens: state.inputTokens,
+        output_tokens: state.outputTokens,
+      },
+    }));
+    events.push(formatSSEEvent("message_stop", { type: "message_stop" }));
+  }
+
+  return events;
 }

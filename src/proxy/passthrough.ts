@@ -28,6 +28,10 @@ import {
   geminiToOpenAI,
   geminiSSEToOpenAI,
   createGeminiStreamState,
+  claudeToGeminiCLI,
+  geminiResponseToClaudeDirect,
+  geminiSSEToClaudeEvents,
+  createGeminiToClaudeStreamState,
 } from "./gemini-translator";
 import {
   MAX_RETRIES,
@@ -316,15 +320,13 @@ async function handleNonClaudeMessages(
     console.log(`[DEBUG] /v1/messages routed to provider: ${provider}, model: ${model}`);
   }
 
-  // Prepare request body:
-  // - Codex: direct Claude → Codex translation (no intermediate OpenAI format)
-  // - Gemini: Claude → OpenAI → Gemini (needs per-account projectId, computed in loop)
+  // Prepare request body (direct Claude → provider translation, no intermediate OpenAI)
   let precomputed: { body: any; toolNameMap: ToolNameMap } | null = null;
   if (provider === "codex") {
     precomputed = claudeToCodexRequest({ ...body, model });
-  } else if (provider !== "gemini") {
-    const openaiBody = claudeRequestToOpenai(body);
-    precomputed = prepareProviderBody(provider, openaiBody, model, "");
+  } else if (provider === "gemini") {
+    // Gemini: compute base once, patch projectId per account in the loop
+    precomputed = { body: claudeToGeminiCLI({ ...body, model }, ""), toolNameMap: new Map() };
   }
 
   let lastStatus = 500;
@@ -344,10 +346,9 @@ async function handleNonClaudeMessages(
 
     manager.recordAttempt(account.token.email, provider, tracking);
 
-    // Gemini needs per-account projectId
-    const prepared = precomputed || prepareProviderBody(
-      provider, claudeRequestToOpenai(body), model, account.projectId,
-    );
+    const prepared = precomputed!;
+    // Patch per-account projectId for Gemini
+    if (provider === "gemini") prepared.body.project = account.projectId;
     const toolNameMap = prepared.toolNameMap;
 
     if (isDebugLevel(config.debug, "verbose")) {
@@ -384,9 +385,16 @@ async function handleNonClaudeMessages(
     if (upstreamResp.ok) {
       if (stream) {
         if (provider === "codex") {
-          // Direct Codex SSE → Claude SSE (no intermediate OpenAI format)
-          await handleCodexDirectStream(
-            upstreamResp, res, model, account, manager, tracking, toolNameMap,
+          const codexState = createCodexToClaudeStreamState(model, toolNameMap);
+          await handleDirectStream(
+            provider, upstreamResp, res, account, manager, tracking,
+            codexState, (data) => codexSSEToClaudeEvents(data, codexState),
+          );
+        } else if (provider === "gemini") {
+          const geminiState = createGeminiToClaudeStreamState(model);
+          await handleDirectStream(
+            provider, upstreamResp, res, account, manager, tracking,
+            geminiState, (data) => geminiSSEToClaudeEvents(data, geminiState),
           );
         } else {
           await handleProviderToClaudeStream(
@@ -398,8 +406,9 @@ async function handleNonClaudeMessages(
         manager.recordSuccess(account.token.email, provider, tracking);
         manager.recordUsage(account.token.email, extractProviderUsage(provider, respData), provider, tracking);
         if (provider === "codex") {
-          // Direct Codex → Claude response (no intermediate OpenAI format)
           res.json(codexResponseToClaudeDirect(respData, model, toolNameMap));
+        } else if (provider === "gemini") {
+          res.json(geminiResponseToClaudeDirect(respData, model));
         } else {
           const openaiResp = translateProviderResponse(provider, respData, model, toolNameMap);
           res.json(openaiResponseToClaude(openaiResp, model));
@@ -455,17 +464,18 @@ async function handleNonClaudeMessages(
 }
 
 /**
- * Handle streaming from Codex, translating SSE directly to Claude Messages SSE format.
- * Pipeline: Codex SSE → Claude SSE events (no intermediate OpenAI format)
+ * Generic handler: stream upstream SSE → Claude Messages SSE via a converter function.
+ * Used by both Codex and Gemini direct translation paths.
  */
-async function handleCodexDirectStream(
+async function handleDirectStream(
+  provider: ProviderType,
   upstreamResp: globalThis.Response,
   res: ExpressResponse,
-  model: string,
   account: { token: { email: string }; accountUuid: string; projectId: string },
   manager: AccountManager,
   tracking: TrackingContext,
-  toolNameMap?: ToolNameMap,
+  state: { inputTokens: number; outputTokens: number },
+  convertChunk: (data: any) => string[],
 ): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -479,7 +489,6 @@ async function handleCodexDirectStream(
   let clientDisconnected = false;
   let sseBuffer = "";
   const decoder = new TextDecoder();
-  const state = createCodexToClaudeStreamState(model, toolNameMap);
 
   res.on("close", () => {
     clientDisconnected = true;
@@ -503,7 +512,7 @@ async function handleCodexDirectStream(
 
         try {
           const data = JSON.parse(raw);
-          const claudeEvents = codexSSEToClaudeEvents(data, state);
+          const claudeEvents = convertChunk(data);
           for (const event of claudeEvents) {
             if (!clientDisconnected) res.write(event);
           }
@@ -512,19 +521,19 @@ async function handleCodexDirectStream(
     }
 
     if (!clientDisconnected) {
-      manager.recordSuccess(account.token.email, "codex", tracking);
+      manager.recordSuccess(account.token.email, provider, tracking);
       manager.recordUsage(account.token.email, {
         inputTokens: state.inputTokens,
         outputTokens: state.outputTokens,
         cacheCreationInputTokens: 0,
         cacheReadInputTokens: 0,
-      }, "codex", tracking);
+      }, provider, tracking);
     }
   } catch {
     if (!clientDisconnected) {
       manager.recordFailure(
         account.token.email, "network",
-        "stream terminated before completion", "codex", tracking,
+        "stream terminated before completion", provider, tracking,
       );
     }
   } finally {

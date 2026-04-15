@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import { formatSSEEvent } from "./shared";
+import { budgetToEffort, formatSSEEvent } from "./shared";
 
 // ── Tool name mapping: shortened → original ──
 
@@ -18,9 +18,8 @@ export function chatCompletionsToCodexRequest(body: any): CodexRequestResult {
     stream: !!body.stream,
   };
 
-  if (body.max_tokens) codexBody.max_output_tokens = body.max_tokens;
-  if (body.temperature !== undefined) codexBody.temperature = body.temperature;
-  if (body.top_p !== undefined) codexBody.top_p = body.top_p;
+  // Note: Codex backend (chatgpt.com/backend-api/codex) does NOT support
+  // max_output_tokens, temperature, or top_p
 
   // reasoning_effort → reasoning (with summary)
   if (body.reasoning_effort) {
@@ -31,6 +30,7 @@ export function chatCompletionsToCodexRequest(body: any): CodexRequestResult {
 
   codexBody.include = ["reasoning.encrypted_content"];
   codexBody.parallel_tool_calls = true;
+  codexBody.store = false;
 
   // Build input[] from messages[]
   const input: any[] = [];
@@ -355,16 +355,6 @@ function shortenToolName(name: string, nameMap: ToolNameMap): string {
   return shortened;
 }
 
-// ── Budget → effort mapping for thinking ──
-
-function budgetToEffort(budget: number): string {
-  if (budget <= 0) return "none";
-  if (budget <= 1024) return "low";
-  if (budget <= 8192) return "medium";
-  if (budget <= 24576) return "high";
-  return "xhigh";
-}
-
 // ══════════════════════════════════════════════════════════════════
 // Direct Claude Messages API ↔ Codex Responses API translators
 // (bypass intermediate OpenAI Chat Completions format)
@@ -379,9 +369,8 @@ export function claudeToCodexRequest(body: any): CodexRequestResult {
     instructions: "",
   };
 
-  if (body.max_tokens) codexBody.max_output_tokens = body.max_tokens;
-  if (body.temperature !== undefined) codexBody.temperature = body.temperature;
-  if (body.top_p !== undefined) codexBody.top_p = body.top_p;
+  // Note: Codex backend (chatgpt.com/backend-api/codex) does NOT support
+  // max_output_tokens, temperature, or top_p
 
   // thinking → reasoning
   if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {

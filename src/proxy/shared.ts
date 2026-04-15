@@ -14,6 +14,14 @@ export const EFFORT_TO_BUDGET: Record<string, number> = {
   xhigh: 32768,
 };
 
+export function budgetToEffort(budget: number): string {
+  if (budget <= 0) return "none";
+  if (budget <= 1024) return "low";
+  if (budget <= 8192) return "medium";
+  if (budget <= 24576) return "high";
+  return "xhigh";
+}
+
 export const MAX_RETRIES = 3;
 export const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
